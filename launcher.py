@@ -2,10 +2,15 @@
 """Coproton - run a Steam game together with an arbitrary program (a trainer).
 
 Modes:
-    coproton                    browser GUI
+    coproton                    configuration window
     coproton --register         register as a Steam compatibility tool
     coproton --selftest         run the built-in checks
     coproton <verb> <cmd...>    compat tool entry point, invoked by Steam
+    coproton --inner <verb> ... the same, already inside the Steam runtime container
+
+The compat tool entry point runs on the host, where a GUI toolkit exists, shows the
+launch window, and then re-enters itself through the Steam Linux Runtime so that the
+game and the program end up in one container, sharing one wine prefix.
 """
 import json
 import os
@@ -14,11 +19,8 @@ import shutil
 import subprocess
 import sys
 import time
-import webbrowser
 import zlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 HERE = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "coproton" / "config.json"
@@ -28,6 +30,9 @@ STEAM_ROOTS = ("~/.steam/root", "~/.steam/steam", "~/.local/share/Steam",
                "~/.var/app/com.valvesoftware.Steam/data/Steam")
 # Tools and runtimes that are not games.
 NOT_A_GAME = re.compile(r"^(Proton|Steam Linux Runtime|Steamworks|SteamVR|.*Redistributable)")
+# Verbs that actually start the game. Steam also asks for paths, and those must not
+# spawn anything.
+LAUNCH_VERBS = ("run", "waitforexitandrun")
 DEFAULT_DELAY = 10
 
 
@@ -91,6 +96,42 @@ def parse_acf(text):
     return field("appid"), field("name"), field("installdir")
 
 
+def app_dir(appid):
+    """Install directory of an installed app, by AppID."""
+    for lib in libraries():
+        acf = lib / ("appmanifest_%s.acf" % appid)
+        if acf.exists():
+            _, _, installdir = parse_acf(acf.read_text(errors="replace"))
+            if installdir:
+                return lib / "common" / installdir
+    return None
+
+
+def parse_runtime_appid(manifest_text):
+    """The require_tool_appid of a toolmanifest.vdf, ignoring // comments."""
+    text = re.sub(r"//[^\n]*", "", manifest_text)
+    m = re.search(r'"require_tool_appid"\s+"(\d+)"', text)
+    return m.group(1) if m else None
+
+
+def proton_runtime(proton):
+    """Path to the Steam Linux Runtime entry point a given Proton demands, or None.
+
+    Modern Proton crashes outside its runtime, and Steam only sets one up for the tool
+    it launches directly. Since Coproton is that tool, it has to build the container
+    itself, and the Proton's own manifest is the authority on which one is needed.
+    """
+    manifest = Path(proton).parent / "toolmanifest.vdf"
+    if not manifest.exists():
+        return None
+    appid = parse_runtime_appid(manifest.read_text(errors="replace"))
+    if not appid:
+        return None                      # Old Proton, runs fine on the host.
+    directory = app_dir(appid)
+    entry = directory / "_v2-entry-point" if directory else None
+    return str(entry) if entry and entry.exists() else None
+
+
 def parse_binary_vdf(data, i=0):
     """Minimal binary VDF reader, enough for shortcuts.vdf. Returns (dict, offset).
 
@@ -136,7 +177,7 @@ def shortcut_appid(entry):
 
 
 def shortcuts():
-    """{appid: {name, dir, non_steam}} for games added to Steam via "Add a Non-Steam Game"."""
+    """{appid: {name, dir, non_steam}} for games added via "Add a Non-Steam Game"."""
     out = {}
     for root in steam_roots():
         for f in root.glob("userdata/*/config/shortcuts.vdf"):
@@ -153,8 +194,8 @@ def shortcuts():
                 name = (entry.get("appname") or "").strip()
                 if not name:
                     continue
-                exe = (entry.get("exe") or "").strip().strip('"')
-                start = (entry.get("startdir") or "").strip().strip('"')
+                exe = unquote_path(entry.get("exe") or "")
+                start = unquote_path(entry.get("startdir") or "")
                 out[shortcut_appid(entry)] = {
                     "name": name,
                     "dir": start or (str(Path(exe).parent) if exe else ""),
@@ -181,21 +222,27 @@ def games():
     return dict(sorted(out.items(), key=lambda kv: kv[1]["name"].lower()))
 
 
-def find_exes(directory, limit=300):
-    """Every .exe under the game directory - the candidates for a trainer."""
-    out = []
-    root = Path(directory)
-    if not root.is_dir():
-        return out
-    for dirpath, dirnames, filenames in os.walk(root):
-        if len(Path(dirpath).relative_to(root).parts) >= 4:
-            dirnames.clear()
-        for f in filenames:
-            if f.lower().endswith(".exe"):
-                out.append(str(Path(dirpath) / f))
-                if len(out) >= limit:
-                    return sorted(out)
-    return sorted(out)
+def prefix_path(appid):
+    """steamapps/compatdata/<appid>, wherever Steam put it."""
+    for lib in libraries():
+        p = lib / "compatdata" / str(appid)
+        if p.is_dir():
+            return p
+    return None
+
+
+def unquote_path(value):
+    """Paths pasted from a file manager or a vdf arrive wrapped in quotes."""
+    return (value or "").strip().strip('"').strip("'").strip()
+
+
+def needs_dotnet(exe):
+    """True if the executable links the .NET runtime, so the prefix needs it too."""
+    try:
+        with open(exe, "rb") as f:
+            return b"mscoree.dll" in f.read(4 << 20).lower()
+    except OSError:
+        return False
 
 
 def wine_bin(proton, name="wine"):
@@ -247,11 +294,43 @@ def register(quiet=False):
     return done
 
 
-# ------------------------------------------------------- launching (compat tool)
+# ------------------------------------------------------------------------- .NET
+
+def install_dotnet(proton, appid, report=print):
+    """winetricks -q dotnet48 into the game prefix, using wine from the chosen Proton.
+
+    Runs on the host: the runtime container ships neither winetricks nor a shell for it.
+    """
+    winetricks = shutil.which("winetricks")
+    if not winetricks:
+        report("winetricks is not installed")
+        return False
+    pfx = prefix_path(appid)
+    wine = wine_bin(proton)
+    if not pfx or not (pfx / "pfx" / "system.reg").exists():
+        report("no prefix yet, start the game once and try again")
+        return False
+    if not wine:
+        report("no wine binary in the selected Proton")
+        return False
+    env = dict(os.environ,
+               WINEPREFIX=str(pfx / "pfx"),
+               WINE=wine,
+               WINESERVER=wine_bin(proton, "wineserver") or "",
+               WINEDLLOVERRIDES="mscoree=d",
+               WINEDEBUG="-all")
+    report("installing .NET 4.8, this takes several minutes...")
+    ok = subprocess.run([winetricks, "-q", "dotnet48"], env=env).returncode == 0
+    report(".NET installed" if ok else "winetricks failed, see the terminal output")
+    return ok
+
+
+# --------------------------------------------------------------------- launching
 
 def log(msg):
     print("[coproton] %s" % msg, file=sys.stderr, flush=True)
     try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
         with LOG.open("a") as f:
             f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
     except OSError:
@@ -269,58 +348,73 @@ def current_appid():
     return os.environ.get("SteamAppId") or os.environ.get("SteamGameId") or ""
 
 
-def install_dotnet(proton):
-    """Run winetricks -q dotnet48 in the game prefix, using wine from the chosen Proton."""
-    winetricks = shutil.which("winetricks")
-    if not winetricks:
-        log("winetricks not found, skipping .NET")
-        return False
-    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
-    wine = wine_bin(proton)
-    if not data or not wine:
-        log("no STEAM_COMPAT_DATA_PATH or no wine in this Proton, skipping .NET")
-        return False
-    pfx = Path(data) / "pfx"
-    if not (pfx / "system.reg").exists():
-        log("prefix is empty, letting Proton create it")
-        subprocess.run([proton, "run", "cmd", "/c", "exit"], check=False)
-    env = dict(os.environ,
-               WINEPREFIX=str(pfx),
-               WINE=wine,
-               WINESERVER=wine_bin(proton, "wineserver") or "",
-               WINEDLLOVERRIDES="mscoree=d",
-               WINEDEBUG="-all")
-    log("running winetricks -q dotnet48, this takes a while")
-    ok = subprocess.run([winetricks, "-q", "dotnet48"], env=env).returncode == 0
-    log(".NET installed" if ok else "winetricks returned an error")
-    return ok
-
-
-def shim(argv):
+def outer(argv):
+    """Host side: show the launch window, then re-enter inside the Steam runtime."""
     verb, cmd = argv[0], argv[1:]
     appid = current_appid()
-    cfg = load()
-    entry = cfg.get(appid, {})
+    entry = load().get(appid, {})
+
+    if verb in LAUNCH_VERBS:
+        action = "run"
+        try:
+            action = gui(appid=appid, launch=True)
+        except Exception as exc:                      # noqa: BLE001
+            # A broken GUI must never stop the game from starting.
+            log("launch window unavailable (%s), using the saved settings" % exc)
+        if action == "cancel":
+            log("cancelled by the user")
+            return 0
+        if action == "save":
+            log("settings saved, game not started")
+            return 0
+        entry = load().get(appid, {})
+
     proton = entry.get("proton") or default_proton()
     if not proton or not os.access(proton, os.X_OK):
         sys.exit("[coproton] no Proton found, configure it by running `coproton`")
 
-    if entry.get("dotnet") and not entry.get("dotnet_done"):
-        if install_dotnet(proton):
-            entry["dotnet_done"] = True
-            cfg[appid] = entry
-            save(cfg)
+    inner_cmd = [sys.executable, str(HERE / "launcher.py"), "--inner", verb, *cmd]
+    runtime = proton_runtime(proton)
+    if runtime:
+        log("entering %s" % Path(runtime).parent.name)
+        inner_cmd = [runtime, "--verb=%s" % verb, "--", *inner_cmd]
+    else:
+        log("selected Proton needs no runtime container")
+    os.environ["COPROTON_PROTON"] = proton
+    return subprocess.run(inner_cmd).returncode
+
+
+def inner(argv):
+    """Container side: start the game, then the program, in one prefix."""
+    verb, cmd = argv[0], argv[1:]
+    appid = current_appid()
+    entry = load().get(appid, {})
+    proton = os.environ.get("COPROTON_PROTON") or entry.get("proton") or default_proton()
+    if not proton:
+        sys.exit("[coproton] no Proton found")
+
+    if verb not in LAUNCH_VERBS:
+        # Steam also asks for paths. Answer and start nothing.
+        return subprocess.run([proton, verb, *cmd]).returncode
 
     log("appid=%s proton=%s" % (appid or "?", Path(proton).parent.name))
     game = subprocess.Popen([proton, verb, *cmd])
 
-    program, extra = entry.get("program"), None
+    program, extra = unquote_path(entry.get("program")), None
     if program and Path(program).exists():
         time.sleep(entry.get("delay", DEFAULT_DELAY))
         if game.poll() is None:
             log("starting %s" % program)
-            extra = subprocess.Popen([proton, "runinprefix", program],
-                                     cwd=str(Path(program).parent))
+            try:
+                # Output is captured: a trainer that dies on startup used to fail silently.
+                with LOG.open("a") as out:
+                    extra = subprocess.Popen([proton, "runinprefix", program],
+                                             cwd=str(Path(program).parent),
+                                             stdout=out, stderr=subprocess.STDOUT)
+            except OSError as exc:
+                log("could not start the program: %s" % exc)
+        else:
+            log("game exited before the program could start")
     elif program:
         log("program not found: %s" % program)
 
@@ -328,174 +422,170 @@ def shim(argv):
     if extra and extra.poll() is None:
         # ponytail: only the wrapper is killed, Proton reaps the wine processes on shutdown.
         extra.terminate()
+    log("game exited with %d" % code)
     return code
 
 
 # ------------------------------------------------------------------------- GUI
 
-PAGE = r"""<!doctype html>
-<html lang="en"><meta charset="utf-8"><title>Coproton</title>
-<style>
-:root { color-scheme: dark light }
-body { font: 15px/1.5 system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 0 20px }
-h1 { font-size: 20px; margin: 0 0 4px }
-p.sub { margin: 0 0 28px; opacity: .6 }
-label { display: block; margin: 18px 0 6px; font-weight: 600 }
-select, input[type=text], input[type=number] {
-  width: 100%; padding: 8px; font: inherit; box-sizing: border-box;
-  border: 1px solid rgba(128,128,128,.5); border-radius: 6px; background: transparent; color: inherit }
-.row { display: flex; align-items: center; gap: 8px; margin: 20px 0 }
-.row input { width: auto }
-.row label { margin: 0; font-weight: 400 }
-button { font: inherit; padding: 9px 18px; border-radius: 6px; border: 1px solid rgba(128,128,128,.5);
-  background: transparent; color: inherit; cursor: pointer }
-button.primary { background: #4a7; border-color: #4a7; color: #041; font-weight: 600 }
-details { margin: 20px 0; opacity: .8 }
-summary { cursor: pointer }
-#msg { margin-top: 18px; min-height: 22px; color: #4a7 }
-.warn { padding: 10px 14px; border: 1px solid #c84; border-radius: 6px; margin-bottom: 20px }
-</style>
-<body>
-<h1>Coproton</h1>
-<p class="sub">A game and a trainer, sharing one wine prefix.</p>
-<div id="warn"></div>
+def gui(appid=None, launch=False):
+    """Configuration window. Returns "cancel", "save" or "run".
 
-<label for="game">Game</label>
-<select id="game"></select>
+    tkinter is imported here and nowhere else: the launch path must keep working on
+    machines without it, and inside the runtime container it does not exist at all.
+    """
+    import tkinter as tk
+    from tkinter import ttk, filedialog
 
-<label for="proton">Proton</label>
-<select id="proton"></select>
+    all_games, all_protons = games(), protons()
+    cfg = load()
+    order = list(all_games)
+    if appid and appid not in all_games:                 # Game Steam knows and we do not.
+        all_games[appid] = {"name": "AppID %s" % appid, "dir": "", "non_steam": True}
+        order.insert(0, appid)
 
-<label for="program">Program to run alongside the game</label>
-<input type="text" id="program" list="exes" placeholder="/path/to/trainer.exe" spellcheck="false">
-<datalist id="exes"></datalist>
+    def label(gid):
+        g = all_games[gid]
+        return "%s%s" % (g["name"], "  [non-Steam]" if g["non_steam"] else "")
 
-<div class="row">
-  <input type="checkbox" id="dotnet">
-  <label for="dotnet">Install .NET 4.8 into the prefix (requires winetricks)</label>
-</div>
+    root = tk.Tk()
+    root.title("Coproton")
+    root.minsize(560, 0)
+    frame = ttk.Frame(root, padding=14)
+    frame.grid(sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    frame.columnconfigure(1, weight=1)
+    result = {"action": "cancel"}
+    row = 0
 
-<details>
-  <summary>Advanced</summary>
-  <label for="delay">Delay before starting the program, seconds</label>
-  <input type="number" id="delay" min="0" max="600">
-</details>
+    def add(text, widget, extra_widget=None):
+        nonlocal row
+        ttk.Label(frame, text=text).grid(row=row, column=0, sticky="w", pady=(0, 8), padx=(0, 10))
+        widget.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        if extra_widget is not None:
+            extra_widget.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(0, 8))
+        row += 1
 
-<button class="primary" id="save">Save</button>
-<button id="quit">Close</button>
-<div id="msg"></div>
+    game_var = tk.StringVar()
+    game_box = ttk.Combobox(frame, textvariable=game_var, state="readonly",
+                            values=[label(g) for g in order])
+    add("Game", game_box)
 
-<script>
-const D = __DATA__;
-const $ = id => document.getElementById(id);
+    proton_var = tk.StringVar()
+    proton_box = ttk.Combobox(frame, textvariable=proton_var, state="readonly",
+                              values=list(all_protons))
+    add("Proton", proton_box)
 
-function fill(sel, entries, empty) {
-  sel.innerHTML = "";
-  if (empty) sel.append(new Option(empty, ""));
-  for (const [value, text] of entries) sel.append(new Option(text, value));
-}
+    program_var = tk.StringVar()
+    program_entry = ttk.Entry(frame, textvariable=program_var)
 
-fill($("game"),
-     Object.entries(D.games).map(([id, g]) =>
-       [id, g.name + (g.non_steam ? "  [non-Steam]" : "") + "  (" + id + ")"]),
-     Object.keys(D.games).length ? null : "no games found");
-fill($("proton"), Object.entries(D.protons).map(([name, path]) => [path, name]));
+    def browse():
+        start = all_games.get(current_game(), {}).get("dir") or str(Path.home())
+        chosen = filedialog.askopenfilename(
+            parent=root, title="Select the program to run with the game",
+            initialdir=start if Path(start).is_dir() else str(Path.home()),
+            filetypes=[("Windows executables", "*.exe"), ("All files", "*")])
+        if chosen:
+            program_var.set(chosen)
+            refresh_hint()
 
-const warn = [];
-if (!Object.keys(D.protons).length) warn.push("No Proton installation found.");
-if (!D.winetricks) warn.push("winetricks is not installed, the .NET checkbox will do nothing.");
-if (!D.registered) warn.push("Could not register with Steam, run <code>coproton --register</code>.");
-$("warn").innerHTML = warn.length ? '<div class="warn">' + warn.join("<br>") + "</div>" : "";
+    add("Program", program_entry, ttk.Button(frame, text="Browse...", command=browse))
 
-async function loadGame() {
-  const id = $("game").value;
-  const c = D.config[id] || {};
-  $("proton").value = c.proton || D.default_proton || "";
-  $("program").value = c.program || "";
-  $("dotnet").checked = !!c.dotnet;
-  $("delay").value = c.delay ?? D.default_delay;
-  $("exes").innerHTML = "";
-  if (!id) return;
-  const exes = await (await fetch("/exes?appid=" + id)).json();
-  for (const e of exes) $("exes").append(new Option(e));
-}
+    dotnet_var = tk.BooleanVar()
+    ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix",
+                    variable=dotnet_var).grid(row=row, column=1, sticky="w", pady=(0, 8))
+    row += 1
 
-$("game").onchange = loadGame;
+    delay_var = tk.StringVar(value=str(DEFAULT_DELAY))
+    add("Delay, seconds", ttk.Spinbox(frame, from_=0, to=600, textvariable=delay_var, width=8))
 
-$("save").onclick = async () => {
-  const id = $("game").value;
-  if (!id) { $("msg").textContent = "Pick a game first."; return; }
-  const body = { appid: id, proton: $("proton").value, program: $("program").value.trim(),
-                 dotnet: $("dotnet").checked, delay: Number($("delay").value) || 0 };
-  D.config[id] = await (await fetch("/save", { method: "POST", body: JSON.stringify(body) })).json();
-  $("msg").textContent = "Saved. Now pick Coproton as the compatibility tool in the game properties.";
-};
+    hint = ttk.Label(frame, text="", wraplength=520, foreground="#b06000")
+    hint.grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 10))
+    row += 1
 
-$("quit").onclick = () => { fetch("/quit"); $("msg").textContent = "You can close this tab."; };
+    def current_game():
+        picked = game_var.get()
+        for gid in order:
+            if label(gid) == picked:
+                return gid
+        return ""
 
-loadGame();
-</script>
-</body></html>
-"""
+    def refresh_hint():
+        notes = []
+        program = unquote_path(program_var.get())
+        if program and not Path(program).exists():
+            notes.append("The program path does not exist.")
+        elif program and needs_dotnet(program) and not dotnet_var.get():
+            notes.append("This program needs .NET, but the checkbox is off. "
+                         "It will silently fail to start.")
+        if not shutil.which("winetricks") and dotnet_var.get():
+            notes.append("winetricks is not installed, .NET cannot be installed.")
+        hint.config(text="  ".join(notes))
 
+    def load_game(*_):
+        c = cfg.get(current_game(), {})
+        chosen = c.get("proton") or default_proton()
+        for name, path in all_protons.items():
+            if path == chosen:
+                proton_var.set(name)
+                break
+        program_var.set(unquote_path(c.get("program")))
+        dotnet_var.set(bool(c.get("dotnet")))
+        delay_var.set(str(c.get("delay", DEFAULT_DELAY)))
+        refresh_hint()
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_):
-        pass
+    game_box.bind("<<ComboboxSelected>>", load_game)
+    program_var.trace_add("write", lambda *_: refresh_hint())
+    dotnet_var.trace_add("write", lambda *_: refresh_hint())
 
-    def reply(self, body, ctype="application/json"):
-        raw = body.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "%s; charset=utf-8" % ctype)
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self):
-        url = urlparse(self.path)
-        if url.path == "/":
-            data = {"games": games(), "protons": protons(), "config": load(),
-                    "default_proton": default_proton(), "default_delay": DEFAULT_DELAY,
-                    "winetricks": bool(shutil.which("winetricks")),
-                    "registered": bool(register(quiet=True))}
-            self.reply(PAGE.replace("__DATA__", json.dumps(data, ensure_ascii=False)), "text/html")
-        elif url.path == "/exes":
-            appid = (parse_qs(url.query).get("appid") or [""])[0]
-            self.reply(json.dumps(find_exes(games().get(appid, {}).get("dir", ""))))
-        elif url.path == "/quit":
-            self.reply("{}")
-            self.server.stop = True
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        if self.path != "/save":
-            return self.send_error(404)
-        n = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(n) or b"{}")
-        cfg = load()
-        entry = cfg.setdefault(body["appid"], {})
-        # Toggling the .NET checkbox clears the "already installed" marker.
-        if entry.get("dotnet") != body["dotnet"]:
+    def store():
+        gid = current_game()
+        if not gid:
+            hint.config(text="Pick a game first.")
+            return None
+        entry = cfg.setdefault(gid, {})
+        was = entry.get("dotnet")
+        entry.update(proton=all_protons.get(proton_var.get(), ""),
+                     program=unquote_path(program_var.get()),
+                     dotnet=dotnet_var.get(),
+                     delay=int(delay_var.get() or 0))
+        if was != entry["dotnet"]:
             entry.pop("dotnet_done", None)
-        entry.update(proton=body["proton"], program=body["program"],
-                     dotnet=body["dotnet"], delay=body["delay"])
         save(cfg)
-        self.reply(json.dumps(entry, ensure_ascii=False))
+        if entry["dotnet"] and not entry.get("dotnet_done"):
+            hint.config(text="Installing .NET, the window will stay busy for a few minutes...")
+            root.update()
+            if install_dotnet(entry["proton"], gid, report=lambda m: (hint.config(text=m), root.update())):
+                entry["dotnet_done"] = True
+                save(cfg)
+        return gid
 
+    def finish(action):
+        if action != "cancel" and store() is None:
+            return
+        result["action"] = action
+        root.destroy()
 
-def gui():
-    register(quiet=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.stop = False
-    url = "http://127.0.0.1:%d/" % server.server_address[1]
-    print("Coproton: %s  (Ctrl+C to quit)" % url)
-    webbrowser.open(url)
-    try:
-        while not server.stop:
-            server.handle_request()
-    except KeyboardInterrupt:
-        pass
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=row, column=0, columnspan=3, sticky="e")
+    ttk.Button(buttons, text="Cancel", command=lambda: finish("cancel")).grid(row=0, column=0, padx=4)
+    ttk.Button(buttons, text="Save", command=lambda: finish("save")).grid(row=0, column=1, padx=4)
+    run_button = ttk.Button(buttons, text="Save and Run", command=lambda: finish("run"))
+    run_button.grid(row=0, column=2, padx=4)
+    if not launch:
+        run_button.state(["disabled"])            # Nothing to run outside a Steam launch.
+
+    if appid and appid in all_games:
+        game_var.set(label(appid))
+        game_box.state(["disabled"])              # Steam already chose the game.
+    elif order:
+        game_var.set(label(order[0]))
+    load_game()
+
+    root.bind("<Escape>", lambda *_: finish("cancel"))
+    root.eval("tk::PlaceWindow . center")
+    root.mainloop()
+    return result["action"]
 
 
 # ------------------------------------------------------------------- selfchecks
@@ -507,7 +597,20 @@ def check_parsers():
     assert parse_paths('"path" "/mnt/games"\n"path" "/home/x/Steam"') == ["/mnt/games", "/home/x/Steam"]
     assert NOT_A_GAME.match("Proton 6.3") and NOT_A_GAME.match("Steam Linux Runtime 3.0")
     assert not NOT_A_GAME.match("Elden Ring")
-    assert "__DATA__" in PAGE and PAGE.count("__DATA__") == 1
+    # A quoted path is what you get from a file manager, and it used to be stored verbatim.
+    assert unquote_path('"/games/My Trainer.exe"') == "/games/My Trainer.exe"
+    assert unquote_path("  '/games/t.exe' ") == "/games/t.exe"
+    assert unquote_path(None) == ""
+
+
+def check_runtime_manifest():
+    """The runtime requirement must survive the comments a real manifest carries."""
+    real = ('"manifest"\n{\n  "version" "2"\n  "commandline" "/proton %verb%"\n'
+            '  "require_tool_appid" "4183110"\n  "use_sessions" "1"\n}')
+    assert parse_runtime_appid(real) == "4183110"
+    commented = '"manifest"\n{\n  // "require_tool_appid" "1628350"\n  "version" "2"\n}'
+    assert parse_runtime_appid(commented) is None, "a commented-out line must not count"
+    assert parse_runtime_appid('"manifest" { "version" "2" }') is None
 
 
 def check_shortcuts():
@@ -525,12 +628,22 @@ def check_shortcuts():
     # Steam names the prefix directory with the unsigned value.
     assert shortcut_appid(entry) == "3755078775", shortcut_appid(entry)
     assert entry["startdir"] == "/mnt/d/Games/Dawnwalker/"
-    # No appid field: fall back to the crc32 algorithm rather than dropping the game.
     assert shortcut_appid({"exe": '"/x/g.exe"', "appname": "G"}).isdigit()
     assert int(shortcut_appid({"exe": '"/x/g.exe"', "appname": "G"})) >= 0x80000000
 
 
-def check_shim():
+def check_dotnet_detection():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        managed, native = Path(tmp) / "a.exe", Path(tmp) / "b.exe"
+        managed.write_bytes(b"MZ\x00\x00" + b"\x00" * 500 + b"mscoree.dll\x00")
+        native.write_bytes(b"MZ\x00\x00" + b"\x00" * 500 + b"KERNEL32.dll\x00")
+        assert needs_dotnet(managed), "a .NET trainer must be recognised"
+        assert not needs_dotnet(native)
+        assert not needs_dotnet(Path(tmp) / "missing.exe")
+
+
+def check_launch():
     """Game and program go to the same proton, and the game's exit code is propagated."""
     import tempfile
     global CONFIG, LOG
@@ -545,11 +658,15 @@ def check_shim():
         stub.chmod(0o755)
         (tmp / "trainer.exe").touch()
         CONFIG, LOG = tmp / "config.json", tmp / "log"
-        # A non-Steam appid, to prove it is read from the compatdata path and not SteamAppId.
-        save({"3755078775": {"proton": str(stub), "program": str(tmp / "trainer.exe"), "delay": 0}})
+        # A quoted path, exactly as the old GUI used to store it.
+        save({"3755078775": {"proton": str(stub),
+                             "program": '"%s"' % (tmp / "trainer.exe"), "delay": 0}})
         os.environ.update(SteamAppId="0", STEAM_COMPAT_DATA_PATH=str(tmp / "3755078775"))
+        os.environ.pop("COPROTON_PROTON", None)
         try:
-            code = shim(["waitforexitandrun", "/games/game.exe", "-windowed"])
+            code = inner(["waitforexitandrun", "/games/game.exe", "-windowed"])
+            # A path query must answer without starting anything.
+            inner(["getcompatpath", "/games/game.exe"])
         finally:
             CONFIG, LOG = saved_config, saved_log
             os.environ.clear()
@@ -557,40 +674,48 @@ def check_shim():
         deadline, lines = time.time() + 3, []
         while time.time() < deadline:
             lines = sorted(calls.read_text().splitlines()) if calls.exists() else []
-            if len(lines) == 2:
+            if len(lines) == 3:
                 break
             time.sleep(0.05)
     assert code == 7, code
-    # Sorted, not in call order: with delay 0 both stubs append concurrently. The ordering
-    # that matters (program after the game, and only while it lives) is the sleep + poll.
-    assert len(lines) == 2, lines
-    assert lines[0].startswith("runinprefix ") and lines[0].endswith("trainer.exe"), lines
-    assert lines[1] == "waitforexitandrun /games/game.exe -windowed", lines
+    # Sorted, not in call order: with delay 0 both stubs append concurrently.
+    assert len(lines) == 3, lines
+    assert lines[0] == "getcompatpath /games/game.exe", lines
+    assert lines[1].startswith("runinprefix ") and lines[1].endswith("trainer.exe"), lines
+    assert '"' not in lines[1], "the quoted path must be cleaned before use: %s" % lines[1]
+    assert lines[2] == "waitforexitandrun /games/game.exe -windowed", lines
 
 
 def selftest():
     check_parsers()
+    check_runtime_manifest()
     check_shortcuts()
-    check_shim()
+    check_dotnet_detection()
+    check_launch()
     for name, path in protons().items():   # Real environment, when there is one.
         assert os.access(path, os.X_OK), name
     found = games()
     non_steam = sum(1 for g in found.values() if g["non_steam"])
-    print("ok: %d protons, %d games (%d non-Steam), %d libraries"
-          % (len(protons()), len(found), non_steam, len(libraries())))
+    runtimes = {Path(r).parent.name for r in
+                (proton_runtime(p) for p in protons().values()) if r}
+    print("ok: %d protons, %d games (%d non-Steam), %d libraries, runtimes: %s"
+          % (len(protons()), len(found), non_steam, len(libraries()),
+             ", ".join(sorted(runtimes)) or "none"))
 
 
 def main():
     args = sys.argv[1:]
     if not args:
-        return gui()
+        return 0 if gui() else 0
     if args[0] == "--register":
         return 0 if register() else 1
     if args[0] == "--selftest":
         return selftest()
+    if args[0] == "--inner":
+        return inner(args[1:])
     if args[0] in ("-h", "--help"):
         return print(__doc__)
-    return shim(args)
+    return outer(args)
 
 
 if __name__ == "__main__":

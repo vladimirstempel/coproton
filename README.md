@@ -4,49 +4,67 @@ Runs a Steam game together with an arbitrary Windows program (a trainer, an over
 **inside the same wine prefix**, and therefore under the same `wineserver`. That shared
 wineserver is what lets a trainer reach the game's memory.
 
-Like Steam Tinker Launch, but three fields and a checkbox.
+Like Steam Tinker Launch, but three fields and a checkbox. Press Play in Steam, a small window
+appears, you pick what to run alongside the game, and the game starts.
 
 ## Install
-
-No root, no package manager, no dependencies beyond `python3` (which every machine running
-Steam already has, since `proton` itself is a Python script):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vladimirstempel/coproton/main/install.sh | sh
 ```
 
-Manual: copy `launcher.py` and both `.vdf` files anywhere and run `./launcher.py --register`.
+Manual: copy `launcher.py`, `coproton.desktop` and both `.vdf` files anywhere and run
+`./launcher.py --register`.
 
-Works on SteamOS, Steam Deck, Bazzite and other immutable distros: everything lands in
-`~/.local` and the rootfs is never touched.
+Everything lands in `~/.local`, no root and no package manager, so this also works on SteamOS,
+Steam Deck, Bazzite and other immutable distros.
+
+### Dependencies
+
+* `python3` — required. Every machine running Steam already has it, since `proton` is itself
+  a Python script.
+* `tk` — needed only for the configuration window. `install.sh` detects the package manager
+  (pacman, apt, dnf, zypper, apk, xbps) and offers to install it for you; answer no and it
+  prints the command instead. Set `COPROTON_YES=1` to skip the prompt. On SteamOS, where the
+  system image is read-only, it prints the `steamos-readonly` dance rather than attempting it.
+  Without Tk games still launch using the settings already saved, so this never fails the
+  install.
+* `winetricks` — optional, only for the .NET checkbox.
 
 ## Usage
 
-1. Run `coproton`. A browser tab opens.
-2. Pick the game, the Proton build and the program. Tick .NET if the program needs it. Save.
-3. Restart Steam.
-4. Game properties → Compatibility → **Coproton**.
-5. Launch the game as usual.
+1. Restart Steam, then set game properties → Compatibility → **Coproton**.
+2. Press Play. The launch window appears:
+   * **Game** — preselected by Steam, shown for confirmation.
+   * **Proton** — which build actually runs the game.
+   * **Program** — the executable to run alongside it, picked with a file dialog.
+   * **Install .NET 4.8** — most trainers are .NET applications and do nothing without it.
+   * **Delay** — how long to wait after the game starts before launching the program.
+3. **Cancel** aborts the launch, **Save** stores the settings without starting the game,
+   **Save and Run** starts the game.
 
-The program starts 10 seconds after the game, so the game process has time to appear.
-If your trainer needs to attach sooner or later, change the delay under "Advanced".
+The same window opens from the application menu (or by running `coproton`) to edit settings
+without launching anything. There **Save and Run** is disabled, since there is no game to run.
 
 ## Non-Steam games
 
-Games added through "Add a Non-Steam Game" are listed too, marked `[non-Steam]`.
+Games added through "Add a Non-Steam Game" work too and are marked `[non-Steam]`.
 They have no `appmanifest_*.acf`, so they are read from the binary `shortcuts.vdf`, and their
 AppID is the unsigned form of the signed int32 stored there, which is also the name of their
-`steamapps/compatdata` directory.
+`steamapps/compatdata` directory. That path, not `SteamAppId`, is what identifies the game at
+launch, because for a non-Steam shortcut `SteamAppId` is `0`.
 
 ## The .NET checkbox
 
-Installs `dotnet48` with `winetricks` into the game's prefix, using the wine binary from the
-Proton build you picked. It runs once on the next launch and is then recorded in the config
-(toggling the checkbox off and on again clears that marker). Expect the first launch to be slow.
+Most trainers are .NET applications: without the runtime in the prefix they exit immediately
+and silently. Ticking the box runs `winetricks -q dotnet48` against the game's prefix, using
+the wine binary from the Proton build you picked, and records that it is done.
 
-`winetricks` is not a hard dependency: everything else works without it and the checkbox just
-prints a warning. Install it the usual way: `pacman -S winetricks`, `apt install winetricks`,
-`dnf install winetricks`.
+The window warns when the chosen executable imports `mscoree.dll` (that is, needs .NET) while
+the checkbox is off, so the silent failure becomes a visible one.
+
+The prefix has to exist first, so if the game has never been launched, start it once and then
+tick the box.
 
 ## Configuration
 
@@ -54,9 +72,9 @@ prints a warning. Install it the usual way: `pacman -S winetricks`, `apt install
 
 ```json
 {
-  "1245620": {
-    "proton": "/home/me/.steam/root/compatibilitytools.d/GE-Proton11-6-x86_64/proton",
-    "program": "/home/me/trainers/EldenRing.exe",
+  "2456085599": {
+    "proton": "/mnt/d/SteamLibrary/steamapps/common/Proton - Experimental/proton",
+    "program": "/mnt/d/Games/Trainers/Trainer.exe",
     "dotnet": true,
     "delay": 10,
     "dotnet_done": true
@@ -64,43 +82,58 @@ prints a warning. Install it the usual way: `pacman -S winetricks`, `apt install
 }
 ```
 
-The last launch is logged to `~/.config/coproton/last.log`.
+The last launch is logged to `~/.config/coproton/last.log`, including anything the program
+printed as it started.
 
 ## How it works
 
 Coproton registers itself as a compatibility tool (a symlink to its own directory in
-`compatibilitytools.d`). Steam then calls `launcher.py waitforexitandrun <game exe>`, which:
+`compatibilitytools.d`), so Steam launches it instead of Proton.
 
-1. resolves the AppID from `STEAM_COMPAT_DATA_PATH` and loads its config;
-2. installs .NET through winetricks if asked to;
-3. starts the game with `proton waitforexitandrun <game>`;
-4. waits, then starts the program with `proton runinprefix <program>` in the same prefix.
-   `run` must not be used here: it re-initialises the prefix and can take down the game's
-   wineserver;
-5. waits for the game to exit, stops the program, and returns the game's exit code so Steam
+The tricky part is the runtime container. Modern Proton declares `require_tool_appid` in its
+own manifest and crashes when run outside that container, but Steam only sets one up for the
+tool it launches directly — which is now Coproton, not Proton. Coproton could simply declare
+the same requirement, except that the container has no Tk, no `yad`, no `zenity` and no
+`winetricks`, so no window could be drawn from inside it.
+
+So the work is split:
+
+1. **On the host**, where a GUI exists, Coproton reads the config, shows the launch window, and
+   looks up which runtime the selected Proton asks for by parsing that Proton's own manifest.
+2. It then **re-enters itself through that runtime's `_v2-entry-point`**, so the game and the
+   program share one container as well as one prefix.
+3. **Inside the container** it starts the game with `proton waitforexitandrun`, waits out the
+   delay, and starts the program with `proton runinprefix`. `run` must not be used here: it
+   re-initialises the prefix and can take down the game's wineserver.
+4. It waits for the game to exit, stops the program, and returns the game's exit code so Steam
    records playtime correctly.
+
+Steam also invokes a compatibility tool to ask about paths rather than to launch anything.
+Those verbs are passed straight through, and start no program.
 
 ## Known limitations
 
-* `toolmanifest.vdf` declares no `require_tool_appid`, so Proton runs outside the Steam Linux
-  Runtime container. Aurora Launcher does the same and it is fine for the vast majority of
-  games. If a specific game refuses to start without the container, add
-  `"require_tool_appid" "1628350"` (sniper) to the manifest and restart Steam.
+* The delay before starting the program is a fixed number of seconds rather than a wait for
+  the game process to appear.
 * Anti-cheat systems (EAC, BattlEye) dislike foreign processes in the prefix. Not something
   this tool can fix.
+* Old Proton builds that declare no runtime are launched directly on the host, which is what
+  they expect.
 
 ## Uninstall
 
 ```sh
-rm -rf ~/.local/lib/coproton ~/.local/bin/coproton \
-       ~/.steam/root/compatibilitytools.d/coproton ~/.config/coproton
+rm -rf ~/.local/lib/coproton ~/.local/bin/coproton ~/.config/coproton \
+       ~/.local/share/applications/coproton.desktop \
+       ~/.steam/root/compatibilitytools.d/coproton
 ```
 
 ## Development
 
-`python3 launcher.py --selftest` checks the vdf/acf parsers, the binary `shortcuts.vdf` reader,
-the page template, and the whole launch sequence against a stub `proton`. No external
-dependencies, no test framework.
+`python3 launcher.py --selftest` checks the acf/vdf parsers, the binary `shortcuts.vdf` reader,
+the runtime-requirement lookup, .NET detection, and the whole launch sequence against a stub
+`proton` — including that a quoted path is cleaned before use and that path queries start
+nothing. No external dependencies, no test framework.
 
 ## License
 
