@@ -1,4 +1,4 @@
-# Maintainer: USER <mail@example.com>
+# Maintainer: Vladimir Stempel <16229503+vladimirstempel@users.noreply.github.com>
 pkgname=coproton
 pkgver=0.1.0
 pkgrel=1
