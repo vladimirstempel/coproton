@@ -382,6 +382,21 @@ def register(quiet=False):
 
 # ------------------------------------------------------------------------- .NET
 
+# Build number -> the winetricks verb that sets it. Proton itself leaves win10 or win11.
+WINVER_BUILDS = {"3790": "winxp64", "7601": "win7", "9600": "win81",
+                 "19045": "win10", "22000": "win11", "26100": "win11"}
+
+
+def prefix_winver(pfx, default="win10"):
+    """The winetricks verb matching the Windows version currently set in the prefix."""
+    try:
+        text = (Path(pfx) / "system.reg").read_text(errors="replace")
+    except OSError:
+        return default
+    m = re.search(r'"CurrentBuild"="(\d+)"', text)
+    return WINVER_BUILDS.get(m.group(1), default) if m else default
+
+
 def install_dotnet(proton, appid, report=print):
     """winetricks -q dotnet48 into the game prefix, using wine from the chosen Proton.
 
@@ -405,8 +420,16 @@ def install_dotnet(proton, appid, report=print):
                WINESERVER=wine_bin(proton, "wineserver") or "",
                WINEDLLOVERRIDES="mscoree=d",
                WINEDEBUG="-all")
+    # The dotnet48 recipe switches the prefix to Windows XP and never switches it back.
+    # A modern game then refuses to use D3D12 ("DirectX 12 is not supported on your
+    # system"), so the version has to be restored whether or not the install succeeded.
+    before = prefix_winver(pfx / "pfx")
     report("installing .NET 4.8, this takes several minutes...")
     ok = subprocess.run([winetricks, "-q", "dotnet48"], env=env).returncode == 0
+    after = prefix_winver(pfx / "pfx")
+    if after != before:
+        report("restoring the Windows version to %s (winetricks left it at %s)" % (before, after))
+        subprocess.run([winetricks, "-q", before], env=env)
     report(".NET installed" if ok else "winetricks failed, see the terminal output")
     return ok
 
@@ -742,6 +765,23 @@ def check_steam_settings():
     assert resolve_proton({"proton": ""})[1] == source, "empty means follow Steam"
 
 
+def check_winver():
+    """Reading the prefix Windows version, so the .NET install can put it back."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        pfx = Path(tmp)
+        win10 = ('[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion]\n'
+                 '"CurrentBuild"="19045"\n"CurrentVersion"="6.3"\n')
+        (pfx / "system.reg").write_text(win10)
+        assert prefix_winver(pfx) == "win10", prefix_winver(pfx)
+        # What winetricks dotnet48 leaves behind, and what broke D3D12.
+        (pfx / "system.reg").write_text(win10.replace("19045", "3790").replace("6.3", "5.2"))
+        assert prefix_winver(pfx) == "winxp64", prefix_winver(pfx)
+        (pfx / "system.reg").write_text('"CurrentBuild"="99999"\n')
+        assert prefix_winver(pfx) == "win10", "an unknown build falls back to win10"
+    assert prefix_winver(Path("/nonexistent")) == "win10", "a missing prefix must not raise"
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -819,6 +859,7 @@ def selftest():
     check_parsers()
     check_runtime_manifest()
     check_steam_settings()
+    check_winver()
     check_shortcuts()
     check_dotnet_detection()
     check_launch()
