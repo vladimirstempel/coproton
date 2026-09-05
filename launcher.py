@@ -88,6 +88,92 @@ def default_proton():
     return names[sorted(names, reverse=True)[0]] if names else None
 
 
+def vdf_block(text, key):
+    """The brace-balanced body that follows "key" in a text vdf, or ""."""
+    at = text.find('"%s"' % key)
+    if at < 0:
+        return ""
+    start = text.find("{", at)
+    if start < 0:
+        return ""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+    return ""
+
+
+def official_internal_name(dirname):
+    """Steam addresses its own Proton builds by an internal name, not by directory.
+
+    "Proton - Experimental" is proton_experimental, "Proton 9.0" is proton_9,
+    "Proton 6.3" is proton_63.
+    """
+    name = dirname.strip()
+    if name.lower().endswith(".0"):
+        name = name[:-2]
+    return "_".join(re.findall(r"[a-z0-9]+", name.lower().replace(".", "")))
+
+
+def compat_tool_names():
+    """{name Steam stores in its settings: path to that tool's proton}."""
+    out = {}
+    for root in steam_roots():
+        for vdf in root.glob("compatibilitytools.d/*/compatibilitytool.vdf"):
+            proton = vdf.parent / "proton"
+            if not proton.exists():
+                continue                       # A wrapper like Coproton itself, not a Proton.
+            text = vdf.read_text(errors="replace")
+            for key in re.findall(r'"([^"]+)"\s*\{', text):
+                if key not in ("compatibilitytools", "compat_tools"):
+                    out[key] = str(proton)
+    for lib in libraries():
+        for proton in lib.glob("common/*/proton"):
+            out.setdefault(official_internal_name(proton.parent.name), str(proton))
+    return out
+
+
+def steam_default_tool_name():
+    """The compatibility tool chosen in Steam Settings -> Compatibility, or None.
+
+    Steam records it as the appid "0" entry of CompatToolMapping. It is absent when
+    "Enable Steam Play for all other titles" has never been turned on.
+    """
+    for root in steam_roots():
+        config = root / "config" / "config.vdf"
+        if not config.exists():
+            continue
+        block = vdf_block(config.read_text(errors="replace"), "CompatToolMapping")
+        m = re.search(r'"0"\s*\{[^}]*?"name"\s*"([^"]*)"', block, re.S)
+        if m and m.group(1):
+            return m.group(1)
+    return None
+
+
+def steam_default_proton():
+    """Path to the Proton that Steam itself would default to, or None."""
+    name = steam_default_tool_name()
+    return compat_tool_names().get(name) if name else None
+
+
+def resolve_proton(entry):
+    """Which Proton to launch with, and a word on where that choice came from.
+
+    An empty "proton" in the config means "whatever Steam is set to use".
+    """
+    chosen = entry.get("proton")
+    if chosen:
+        return chosen, "configured"
+    followed = steam_default_proton()
+    if followed:
+        return followed, "Steam default"
+    return default_proton(), "newest installed"
+
+
 def parse_acf(text):
     """Pull appid, name and installdir out of an appmanifest_*.acf."""
     def field(k):
@@ -369,9 +455,10 @@ def outer(argv):
             return 0
         entry = load().get(appid, {})
 
-    proton = entry.get("proton") or default_proton()
+    proton, source = resolve_proton(entry)
     if not proton or not os.access(proton, os.X_OK):
         sys.exit("[coproton] no Proton found, configure it by running `coproton`")
+    log("proton=%s (%s)" % (Path(proton).parent.name, source))
 
     inner_cmd = [sys.executable, str(HERE / "launcher.py"), "--inner", verb, *cmd]
     runtime = proton_runtime(proton)
@@ -381,7 +468,11 @@ def outer(argv):
     else:
         log("selected Proton needs no runtime container")
     os.environ["COPROTON_PROTON"] = proton
-    return subprocess.run(inner_cmd).returncode
+    code = subprocess.run(inner_cmd).returncode
+    if code != 0:
+        # This used to fail silently, which hid a broken container for a whole session.
+        log("inner process exited with %d" % code)
+    return code
 
 
 def inner(argv):
@@ -389,7 +480,7 @@ def inner(argv):
     verb, cmd = argv[0], argv[1:]
     appid = current_appid()
     entry = load().get(appid, {})
-    proton = os.environ.get("COPROTON_PROTON") or entry.get("proton") or default_proton()
+    proton = os.environ.get("COPROTON_PROTON") or resolve_proton(entry)[0]
     if not proton:
         sys.exit("[coproton] no Proton found")
 
@@ -471,9 +562,13 @@ def gui(appid=None, launch=False):
                             values=[label(g) for g in order])
     add("Game", game_box)
 
+    # Following Steam is the default: an empty "proton" in the config means this entry.
+    steam_pick = steam_default_proton()
+    follow = "Steam default (%s)" % (Path(steam_pick).parent.name if steam_pick
+                                     else "not set in Steam settings")
     proton_var = tk.StringVar()
     proton_box = ttk.Combobox(frame, textvariable=proton_var, state="readonly",
-                              values=list(all_protons))
+                              values=[follow] + list(all_protons))
     add("Proton", proton_box)
 
     program_var = tk.StringVar()
@@ -524,11 +619,9 @@ def gui(appid=None, launch=False):
 
     def load_game(*_):
         c = cfg.get(current_game(), {})
-        chosen = c.get("proton") or default_proton()
-        for name, path in all_protons.items():
-            if path == chosen:
-                proton_var.set(name)
-                break
+        chosen = c.get("proton")
+        proton_var.set(next((n for n, p in all_protons.items() if p == chosen), follow)
+                       if chosen else follow)
         program_var.set(unquote_path(c.get("program")))
         dotnet_var.set(bool(c.get("dotnet")))
         delay_var.set(str(c.get("delay", DEFAULT_DELAY)))
@@ -545,7 +638,8 @@ def gui(appid=None, launch=False):
             return None
         entry = cfg.setdefault(gid, {})
         was = entry.get("dotnet")
-        entry.update(proton=all_protons.get(proton_var.get(), ""),
+        picked = proton_var.get()
+        entry.update(proton="" if picked == follow else all_protons.get(picked, ""),
                      program=unquote_path(program_var.get()),
                      dotnet=dotnet_var.get(),
                      delay=int(delay_var.get() or 0))
@@ -555,7 +649,9 @@ def gui(appid=None, launch=False):
         if entry["dotnet"] and not entry.get("dotnet_done"):
             hint.config(text="Installing .NET, the window will stay busy for a few minutes...")
             root.update()
-            if install_dotnet(entry["proton"], gid, report=lambda m: (hint.config(text=m), root.update())):
+            # .NET goes into the prefix with the wine of whichever Proton will run it.
+            if install_dotnet(resolve_proton(entry)[0], gid,
+                              report=lambda m: (hint.config(text=m), root.update())):
                 entry["dotnet_done"] = True
                 save(cfg)
         return gid
@@ -611,6 +707,39 @@ def check_runtime_manifest():
     commented = '"manifest"\n{\n  // "require_tool_appid" "1628350"\n  "version" "2"\n}'
     assert parse_runtime_appid(commented) is None, "a commented-out line must not count"
     assert parse_runtime_appid('"manifest" { "version" "2" }') is None
+
+
+def check_steam_settings():
+    """The global Proton choice lives in a nested vdf block keyed by appid "0"."""
+    assert official_internal_name("Proton - Experimental") == "proton_experimental"
+    assert official_internal_name("Proton Hotfix") == "proton_hotfix"
+    assert official_internal_name("Proton 9.0") == "proton_9", official_internal_name("Proton 9.0")
+    assert official_internal_name("Proton 6.3") == "proton_63"
+    assert official_internal_name("Proton 4.11") == "proton_411"
+
+    config = '''"InstallConfigStore"
+{
+  "Software" { "Valve" { "Steam"
+  {
+    "CompatToolMapping"
+    {
+      "0"       { "name" "proton_experimental" "config" "" "priority" "75" }
+      "1284210" { "name" "GE-Proton10-32"      "config" "" "priority" "250" }
+    }
+  } } }
+}'''
+    block = vdf_block(config, "CompatToolMapping")
+    assert '"0"' in block and "GE-Proton10-32" in block
+    # The block must stop at its own closing brace, not swallow the rest of the file.
+    assert "InstallConfigStore" not in block
+    assert re.search(r'"0"\s*\{[^}]*?"name"\s*"([^"]*)"', block).group(1) == "proton_experimental"
+    assert vdf_block(config, "NoSuchKey") == ""
+
+    # An explicit choice wins, then Steam's, then the newest installed build.
+    assert resolve_proton({"proton": "/x/proton"}) == ("/x/proton", "configured")
+    path, source = resolve_proton({})
+    assert source in ("Steam default", "newest installed"), source
+    assert resolve_proton({"proton": ""})[1] == source, "empty means follow Steam"
 
 
 def check_shortcuts():
@@ -689,6 +818,7 @@ def check_launch():
 def selftest():
     check_parsers()
     check_runtime_manifest()
+    check_steam_settings()
     check_shortcuts()
     check_dotnet_detection()
     check_launch()
