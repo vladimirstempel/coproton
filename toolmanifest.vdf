@@ -1,5 +1,10 @@
 "manifest"
 {
-  "commandline" "/launcher.py run"
-  "commandline_waitforexitandrun" "/launcher.py waitforexitandrun"
+  "version" "2"
+  "commandline" "/launcher.py %verb%"
+
+  // Modern Proton refuses to work outside this runtime. Steam only sets it up for
+  // tools that ask for it, so a wrapper must repeat the requirement of the Proton
+  // it wraps, otherwise the game starts on the host and crashes.
+  "require_tool_appid" "4183110"
 }

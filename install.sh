@@ -8,7 +8,7 @@ REPO="${COPROTON_REPO:-vladimirstempel/coproton}"
 BRANCH="${COPROTON_BRANCH:-main}"
 DEST="${COPROTON_DEST:-$HOME/.local/lib/coproton}"
 BIN="$HOME/.local/bin"
-FILES="launcher.py toolmanifest.vdf compatibilitytool.vdf"
+FILES="launcher.py toolmanifest.vdf compatibilitytool.vdf coproton.desktop"
 
 command -v python3 >/dev/null 2>&1 || {
   echo "python3 is required. Every distro that runs Steam ships it, install it the usual way." >&2
@@ -39,7 +39,27 @@ done
 chmod +x "$DEST/launcher.py"
 ln -sf "$DEST/launcher.py" "$BIN/coproton"
 
+# Desktop entry, so the window can be opened without a terminal.
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$APPS"
+sed "s|__EXEC__|$BIN/coproton|" "$DEST/coproton.desktop" > "$APPS/coproton.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$APPS" 2>/dev/null || true
+fi
+
 "$DEST/launcher.py" --register || true
+
+# The window needs Tk. The launch path does not, so a missing Tk is a warning, not a failure.
+if ! python3 -c "import tkinter" >/dev/null 2>&1; then
+  echo
+  echo "Warning: python3 tkinter is missing, the configuration window cannot open."
+  if   command -v pacman >/dev/null 2>&1; then echo "  sudo pacman -S tk"
+  elif command -v apt    >/dev/null 2>&1; then echo "  sudo apt install python3-tk"
+  elif command -v dnf    >/dev/null 2>&1; then echo "  sudo dnf install python3-tkinter"
+  elif command -v zypper >/dev/null 2>&1; then echo "  sudo zypper install python3-tk"
+  else echo "  install the tkinter package for python3"
+  fi
+fi
 
 case ":$PATH:" in
   *":$BIN:"*) cmd="coproton" ;;
@@ -51,4 +71,4 @@ esac
 echo
 echo "Done. Configure with:  $cmd"
 echo "Then restart Steam and pick Coproton in the game properties."
-echo "Uninstall:            rm -rf '$DEST' '$BIN/coproton' ~/.steam/root/compatibilitytools.d/coproton"
+echo "Uninstall:            rm -rf '$APPS/coproton.desktop' '$DEST' '$BIN/coproton' ~/.steam/root/compatibilitytools.d/coproton"

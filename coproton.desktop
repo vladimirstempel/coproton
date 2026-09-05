@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Coproton
+GenericName=Steam game and trainer launcher
+Comment=Run a Steam game together with an arbitrary program
+Exec=__EXEC__
+Icon=applications-games
+Terminal=false
+Categories=Game;Utility;Settings;
+Keywords=steam;proton;trainer;wine;
