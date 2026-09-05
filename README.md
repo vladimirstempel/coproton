@@ -15,8 +15,6 @@ Steam already has, since `proton` itself is a Python script):
 curl -fsSL https://raw.githubusercontent.com/vladimirstempel/coproton/main/install.sh | sh
 ```
 
-Arch / AUR: `paru -S coproton`
-
 Manual: copy `launcher.py` and both `.vdf` files anywhere and run `./launcher.py --register`.
 
 Works on SteamOS, Steam Deck, Bazzite and other immutable distros: everything lands in
