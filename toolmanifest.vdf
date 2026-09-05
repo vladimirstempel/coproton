@@ -1,0 +1,5 @@
+"manifest"
+{
+  "commandline" "/launcher.py run"
+  "commandline_waitforexitandrun" "/launcher.py waitforexitandrun"
+}
