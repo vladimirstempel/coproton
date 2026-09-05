@@ -49,15 +49,61 @@ fi
 
 "$DEST/launcher.py" --register || true
 
-# The window needs Tk. The launch path does not, so a missing Tk is a warning, not a failure.
+# The configuration window needs Tk. Launching a game does not, so failing to install it
+# is never fatal here: the game still starts with whatever settings were already saved.
+
+# "<package>|<install command>" for the local package manager, empty if unknown.
+tk_package() {
+  if   command -v pacman       >/dev/null 2>&1; then echo "tk|pacman -S --needed --noconfirm tk"
+  elif command -v apt-get      >/dev/null 2>&1; then echo "python3-tk|apt-get install -y python3-tk"
+  elif command -v dnf          >/dev/null 2>&1; then echo "python3-tkinter|dnf install -y python3-tkinter"
+  elif command -v zypper       >/dev/null 2>&1; then echo "python3-tk|zypper --non-interactive install python3-tk"
+  elif command -v apk          >/dev/null 2>&1; then echo "python3-tkinter|apk add python3-tkinter"
+  elif command -v xbps-install >/dev/null 2>&1; then echo "python3-tkinter|xbps-install -y python3-tkinter"
+  fi
+}
+
+# Reads from /dev/tty, not stdin: under "curl | sh" stdin is the script itself.
+confirm() {
+  [ "${COPROTON_YES:-}" = "1" ] && return 0
+  [ -e /dev/tty ] || return 1
+  printf '%s [Y/n] ' "$1" >/dev/tty
+  read -r answer </dev/tty || return 1
+  case "$answer" in "" | y | Y | yes | YES) return 0 ;; *) return 1 ;; esac
+}
+
 if ! python3 -c "import tkinter" >/dev/null 2>&1; then
   echo
-  echo "Warning: python3 tkinter is missing, the configuration window cannot open."
-  if   command -v pacman >/dev/null 2>&1; then echo "  sudo pacman -S tk"
-  elif command -v apt    >/dev/null 2>&1; then echo "  sudo apt install python3-tk"
-  elif command -v dnf    >/dev/null 2>&1; then echo "  sudo dnf install python3-tkinter"
-  elif command -v zypper >/dev/null 2>&1; then echo "  sudo zypper install python3-tk"
-  else echo "  install the tkinter package for python3"
+  echo "The configuration window needs python3 tkinter, which is not installed."
+  spec=$(tk_package || true)
+  package=${spec%%|*}
+  install_cmd=${spec#*|}
+
+  if [ "$(id -u)" -eq 0 ]; then
+    sudo_cmd=""
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo_cmd="sudo"
+  else
+    sudo_cmd="none"
+  fi
+
+  if [ -z "$spec" ]; then
+    echo "Could not identify the package manager. Install the tkinter package for python3."
+  elif command -v steamos-readonly >/dev/null 2>&1; then
+    # SteamOS and friends: the rootfs is read-only and unlocking it is the user's call.
+    echo "This looks like SteamOS, where the system image is read-only. To install it:"
+    echo "  sudo steamos-readonly disable && sudo $install_cmd && sudo steamos-readonly enable"
+  elif [ "$sudo_cmd" = "none" ]; then
+    echo "sudo is not available. Install it as root:  $install_cmd"
+  elif confirm "Install $package now?"; then
+    # shellcheck disable=SC2086
+    if $sudo_cmd $install_cmd && python3 -c "import tkinter" >/dev/null 2>&1; then
+      echo "tkinter is ready."
+    else
+      echo "Installation did not succeed. Install it by hand:  $sudo_cmd $install_cmd"
+    fi
+  else
+    echo "Skipped. Install it later with:  $sudo_cmd $install_cmd"
   fi
 fi
 

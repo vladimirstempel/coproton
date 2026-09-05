@@ -23,9 +23,12 @@ Steam Deck, Bazzite and other immutable distros.
 
 * `python3` — required. Every machine running Steam already has it, since `proton` is itself
   a Python script.
-* `tk` — required only for the configuration window. Without it games still launch with the
-  settings already saved, so a missing Tk is a warning rather than a failure.
-  `sudo pacman -S tk`, `sudo apt install python3-tk`, `sudo dnf install python3-tkinter`.
+* `tk` — needed only for the configuration window. `install.sh` detects the package manager
+  (pacman, apt, dnf, zypper, apk, xbps) and offers to install it for you; answer no and it
+  prints the command instead. Set `COPROTON_YES=1` to skip the prompt. On SteamOS, where the
+  system image is read-only, it prints the `steamos-readonly` dance rather than attempting it.
+  Without Tk games still launch using the settings already saved, so this never fails the
+  install.
 * `winetricks` — optional, only for the .NET checkbox.
 
 ## Usage
