@@ -36,7 +36,12 @@ Steam Deck, Bazzite and other immutable distros.
 1. Restart Steam, then set game properties → Compatibility → **Coproton**.
 2. Press Play. The launch window appears:
    * **Game** — preselected by Steam, shown for confirmation.
-   * **Proton** — which build actually runs the game.
+   * **Proton** — which build actually runs the game. The default entry, *Steam default*,
+     follows whatever is set in Steam Settings → Compatibility, so Coproton does not become
+     a second place to keep that choice up to date. Steam records it as the appid `0` entry
+     of `CompatToolMapping` in `config.vdf`, and it only exists once "Enable Steam Play for
+     all other titles" has been turned on. When it is unset, the entry says so and the newest
+     installed build is used instead.
    * **Program** — the executable to run alongside it, picked with a file dialog.
    * **Install .NET 4.8** — most trainers are .NET applications and do nothing without it.
    * **Delay** — how long to wait after the game starts before launching the program.
