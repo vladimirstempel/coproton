@@ -36,6 +36,17 @@ NOT_A_GAME = re.compile(r"^(Proton|Steam Linux Runtime|Steamworks|SteamVR|.*Redi
 LAUNCH_VERBS = ("run", "waitforexitandrun")
 DEFAULT_DELAY = 10
 
+# WeMod ships as a NuGet package, so unpacking lib/net45 gives a portable copy with no
+# installer, no Squirrel stubs and no updater. The version is pinned on purpose: 12.x draws
+# nothing but a black window under wine no matter what is done to the prefix or which
+# Chromium flags are passed, while 11.6.0 renders and applies cheats. Hash and URL shape
+# come from the scoop-games manifest.
+WEMOD_VERSION = "11.6.0"
+WEMOD_URL = "https://storage-cdn.wemod.com/app/releases/stable/WeMod-%s-full.nupkg" % WEMOD_VERSION
+WEMOD_SHA256 = "5b94ae5592e698b13cbc06fae4c096fe2438cbd362daac3f842e13190bf836ba"
+WEMOD_DIR = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+             / "coproton" / ("wemod-" + WEMOD_VERSION))
+
 
 # ------------------------------------------------------------------ discovery
 
@@ -389,6 +400,71 @@ def prefix_winver(pfx, default="win10"):
     return WINVER_BUILDS.get(m.group(1), default) if m else default
 
 
+def wemod_exe():
+    """Path to the unpacked WeMod, or None when it has not been set up yet."""
+    exe = WEMOD_DIR / "WeMod.exe"
+    return str(exe) if exe.exists() else None
+
+
+def unpack_wemod(package, dest):
+    """Unpack lib/net45 out of a WeMod .nupkg into dest. Returns the path to WeMod.exe."""
+    import zipfile
+    prefix = "lib/net45/"
+    dest = Path(dest)
+    with zipfile.ZipFile(package) as archive:
+        members = [n for n in archive.namelist()
+                   if n.startswith(prefix) and not n.endswith("/")]
+        if not any(n == prefix + "WeMod.exe" for n in members):
+            raise ValueError("no lib/net45/WeMod.exe in %s" % Path(package).name)
+        for name in members:
+            # Refuse anything that would climb out of dest.
+            target = (dest / name[len(prefix):]).resolve()
+            if not str(target).startswith(str(dest.resolve())):
+                raise ValueError("archive escapes the destination: %s" % name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(name) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+    return str(dest / "WeMod.exe")
+
+
+def install_wemod(report=print):
+    """Download the pinned WeMod build and unpack it. Returns the exe path, or None."""
+    import hashlib
+    import tempfile
+    import urllib.request
+    if wemod_exe():
+        return wemod_exe()
+    WEMOD_DIR.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".nupkg", delete=False) as tmp:
+            package = tmp.name
+            with urllib.request.urlopen(WEMOD_URL) as response:
+                total = int(response.headers.get("Content-Length") or 0)
+                done = 0
+                for chunk in iter(lambda: response.read(1 << 20), b""):
+                    tmp.write(chunk)
+                    digest.update(chunk)
+                    done += len(chunk)
+                    if total:
+                        report("downloading WeMod %s: %d%%" % (WEMOD_VERSION, done * 100 // total))
+        if digest.hexdigest() != WEMOD_SHA256:
+            report("the download does not match its known checksum, discarding it")
+            return None
+        report("unpacking WeMod %s..." % WEMOD_VERSION)
+        exe = unpack_wemod(package, WEMOD_DIR)
+    except (OSError, ValueError) as exc:
+        report("could not set up WeMod: %s" % exc)
+        return None
+    finally:
+        try:
+            os.unlink(package)
+        except (OSError, NameError):
+            pass
+    report("WeMod %s is ready" % WEMOD_VERSION)
+    return exe
+
+
 def deref_symlinks(win_dir, report=print):
     """Replace file symlinks under drive_c/windows with real copies. Returns the count.
 
@@ -646,7 +722,22 @@ def gui(appid=None, launch=False):
             program_var.set(chosen)
             refresh_hint()
 
-    add("Program", program_entry, ttk.Button(frame, text="Browse...", command=browse))
+    def use_wemod():
+        """Fetch WeMod on first use, then point the Program field at it."""
+        exe = wemod_exe()
+        if not exe:
+            hint.config(text="Setting up WeMod, this downloads about 160 MB...")
+            root.update()
+            exe = install_wemod(report=lambda m: (hint.config(text=m), root.update()))
+        if exe:
+            program_var.set(exe)
+            dotnet_var.set(True)   # The net45 build needs the real framework, not wine-mono.
+            refresh_hint()
+
+    program_buttons = ttk.Frame(frame)
+    ttk.Button(program_buttons, text="Browse...", command=browse).grid(row=0, column=0)
+    ttk.Button(program_buttons, text="WeMod", command=use_wemod).grid(row=0, column=1, padx=(6, 0))
+    add("Program", program_entry, program_buttons)
 
     dotnet_var = tk.BooleanVar()
     ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix (rarely needed)",
@@ -681,6 +772,9 @@ def gui(appid=None, launch=False):
         if dotnet_var.get():
             if not shutil.which("winetricks"):
                 notes.append("winetricks is not installed, .NET cannot be installed.")
+            elif program and program == wemod_exe():
+                notes.append("WeMod is a net45 build and does need the real framework, "
+                             "so leave this ticked.")
             else:
                 notes.append("Rarely needed: .NET programs, WPF included, normally run on "
                              "the wine-mono Proton ships, and installing .NET removes it. "
@@ -857,6 +951,42 @@ def check_deref():
         assert real.read_bytes() == b"builtin", "the read-only original must be untouched"
 
 
+def check_wemod_unpack():
+    """Only lib/net45 is taken out of the package, and nothing may escape the target."""
+    import tempfile
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        package = tmp / "wemod.nupkg"
+        with zipfile.ZipFile(package, "w") as archive:
+            archive.writestr("lib/net45/WeMod.exe", b"MZ app")
+            archive.writestr("lib/net45/resources/app.asar", b"resources")
+            archive.writestr("WeMod.nuspec", b"metadata that must stay behind")
+        exe = unpack_wemod(package, tmp / "out")
+        assert Path(exe).read_bytes() == b"MZ app", "the executable is unpacked"
+        assert (tmp / "out" / "resources" / "app.asar").exists(), "and so is what it needs"
+        assert not (tmp / "out" / "WeMod.nuspec").exists(), "packaging metadata is skipped"
+
+        escaping = tmp / "evil.nupkg"
+        with zipfile.ZipFile(escaping, "w") as archive:
+            archive.writestr("lib/net45/WeMod.exe", b"MZ")
+            archive.writestr("lib/net45/../../../escaped", b"nope")
+        try:
+            unpack_wemod(escaping, tmp / "out2")
+            raise AssertionError("a path climbing out of the target must be refused")
+        except ValueError:
+            pass
+
+        wrong = tmp / "wrong.nupkg"
+        with zipfile.ZipFile(wrong, "w") as archive:
+            archive.writestr("lib/net48/WeMod.exe", b"MZ")
+        try:
+            unpack_wemod(wrong, tmp / "out3")
+            raise AssertionError("a package without lib/net45/WeMod.exe must be refused")
+        except ValueError:
+            pass
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -928,6 +1058,7 @@ def selftest():
     check_runtime_manifest()
     check_steam_settings()
     check_deref()
+    check_wemod_unpack()
     check_winver()
     check_shortcuts()
     check_launch()

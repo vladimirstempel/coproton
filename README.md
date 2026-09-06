@@ -88,6 +88,30 @@ One thing is **not** handled: wine 11 fails to unpack the installer's cabinets
 (`err:msi:extract_cabinet FDICopy failed`), so nothing installs under Proton Experimental or
 GE-Proton11. wine 10 unpacks them fine, so pick a GE-Proton10 build when you need .NET.
 
+## WeMod
+
+The **WeMod** button next to the Program field downloads WeMod, unpacks it and points the
+Program field at it. It also ticks .NET, which this one genuinely needs.
+
+Two things are deliberate:
+
+* **The version is pinned to 11.6.0.** WeMod 12.x starts, stays running, logs nothing at all
+  and draws a black window. Nothing fixes it: not `--disable-gpu`, not disabling
+  DirectComposition, not `--no-sandbox`, not pure SwiftShader rendering, not swapping the
+  graphics libraries for the ones other launchers install. 11.6.0 renders and applies cheats
+  in the same prefix, so the build is the variable that matters.
+* **It is unpacked, not installed.** WeMod ships as a NuGet package, and `lib/net45` inside it
+  is a portable copy. No installer, no Squirrel stubs that swallow arguments, no updater that
+  would drag the version forward again. The download is checked against a known SHA-256.
+
+It needs the real .NET Framework, so the prefix has to go through the .NET install described
+above, which in turn means a Proton built on wine 10.
+
+`vkd3d` and `dxvk2030`, which [wemod-launcher](https://github.com/DeckCheatz/wemod-launcher)
+installs, are **not** needed. They were tried and reverted: they change nothing for WeMod, and
+the leftover `libvkd3d-*.dll` they leave behind coincided with the game dying on a
+`vkCreateComputePipelines` assertion inside winevulkan.
+
 ## When the program does not start
 
 Read `~/.config/coproton/last.log` first. Everything the program prints on startup is captured
