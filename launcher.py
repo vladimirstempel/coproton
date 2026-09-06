@@ -720,9 +720,14 @@ def inner(argv):
     program, extra = unquote_path(entry.get("program")), None
     # Electron programs need --disable-gpu under wine, so the flags have to be settable.
     args = shlex.split(entry.get("args") or "")
+    env = os.environ
     if program and Path(program).exists():
         if program == wemod_exe():
             share_wemod_profile(log)
+            # wemod_enhancer drops a proxy version.dll next to WeMod.exe. Wine answers
+            # with its own builtin unless the load order asks for a native one first,
+            # and then Electron rejects the patched app.asar.
+            env = dict(os.environ, WINEDLLOVERRIDES="version=n,b")
         time.sleep(entry.get("delay", DEFAULT_DELAY))
         if game.poll() is None:
             log("starting %s" % program)
@@ -730,7 +735,7 @@ def inner(argv):
                 # Output is captured: a trainer that dies on startup used to fail silently.
                 with LOG.open("a") as out:
                     extra = subprocess.Popen([proton, "runinprefix", program, *args],
-                                             cwd=str(Path(program).parent),
+                                             cwd=str(Path(program).parent), env=env,
                                              stdout=out, stderr=subprocess.STDOUT)
             except OSError as exc:
                 log("could not start the program: %s" % exc)

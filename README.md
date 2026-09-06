@@ -127,6 +127,10 @@ one profile in `~/.local/share/coproton/wemod-profile` and links it into each pr
 time WeMod starts there, so signing in once is enough. Run one game at a time: two copies of
 WeMod on the same profile will fight over the file locks.
 
+WeMod's Pro features can be unlocked in the unpacked copy with a third party patch.
+Coproton does not apply it, but it does launch WeMod so that a patched copy works. See
+[WEMOD-PRO.md](WEMOD-PRO.md).
+
 `vkd3d` and `dxvk2030`, which [wemod-launcher](https://github.com/DeckCheatz/wemod-launcher)
 installs, are **not** needed. They were tried and reverted: they change nothing for WeMod, and
 the leftover `libvkd3d-*.dll` they leave behind coincided with the game dying on a
