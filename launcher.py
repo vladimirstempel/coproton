@@ -420,6 +420,16 @@ def install_dotnet(proton, appid, report=print):
                WINESERVER=wine_bin(proton, "wineserver") or "",
                WINEDLLOVERRIDES="mscoree=d",
                WINEDEBUG="-all")
+    # Proton pre-registers a .NET 4.7 that does not exist, so that apps checking for the
+    # framework find one and then run on wine-mono. The real installer reads the same keys,
+    # decides .NET is already present and quits without a word.
+    for view in ("Software", r"Software\Wow6432Node"):
+        subprocess.run([wine, "reg", "delete",
+                        r"HKLM\%s\Microsoft\NET Framework Setup\NDP\v4" % view, "/f"],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if env["WINESERVER"]:
+        subprocess.run([env["WINESERVER"], "-w"], env=env, check=False)
+
     # The dotnet48 recipe switches the prefix to Windows XP and never switches it back.
     # A modern game then refuses to use D3D12 ("DirectX 12 is not supported on your
     # system"), so the version has to be restored whether or not the install succeeded.
@@ -430,7 +440,13 @@ def install_dotnet(proton, appid, report=print):
     if after != before:
         report("restoring the Windows version to %s (winetricks left it at %s)" % (before, after))
         subprocess.run([winetricks, "-q", before], env=env)
-    report(".NET installed" if ok else "winetricks failed, see the terminal output")
+    if ok:
+        report(".NET installed")
+    else:
+        # wine 11 cannot unpack the installer's cabinets ("err:msi:extract_cabinet FDICopy
+        # failed"), while wine 10 can. Naming a Proton that works beats a bare failure.
+        report("winetricks failed. The .NET installer does not unpack under wine 11, "
+               "so pick a Proton built on wine 10 (GE-Proton10) and try again.")
     return ok
 
 
