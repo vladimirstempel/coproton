@@ -820,6 +820,20 @@ def style_window(root, ttk, tkfont):
     return c
 
 
+def show_hidden_files(root, tk):
+    """Make the file dialog show dot-directories, and offer a checkbox to hide them again.
+
+    Tk hides them by default, which puts ~/.local and ~/.steam out of reach, and that is
+    where both WeMod and the prefixes live.
+    """
+    try:
+        root.tk.call("catch", "tk_getOpenFile -badoption")   # Loads the dialog's own code.
+        root.tk.call("set", "::tk::dialog::file::showHiddenBtn", "1")
+        root.tk.call("set", "::tk::dialog::file::showHiddenVar", "1")
+    except tk.TclError:                                      # A native dialog, nothing to do.
+        pass
+
+
 def gui(appid=None, launch=False):
     """Configuration window. Returns "cancel", "save" or "run".
 
@@ -846,6 +860,7 @@ def gui(appid=None, launch=False):
     root.title("Coproton")
     root.minsize(620, 0)
     colors = style_window(root, ttk, tkfont)
+    show_hidden_files(root, tk)
     frame = ttk.Frame(root, padding=20)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
