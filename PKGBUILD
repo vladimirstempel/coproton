@@ -22,6 +22,7 @@ package() {
   install -Dm644 toolmanifest.vdf     "$pkgdir/usr/lib/$pkgname/toolmanifest.vdf"
   install -Dm644 compatibilitytool.vdf "$pkgdir/usr/lib/$pkgname/compatibilitytool.vdf"
   install -Dm644 README.md            "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 WEMOD-PRO.md         "$pkgdir/usr/share/doc/$pkgname/WEMOD-PRO.md"
   install -d "$pkgdir/usr/bin"
   ln -s "/usr/lib/$pkgname/launcher.py" "$pkgdir/usr/bin/$pkgname"
 }
