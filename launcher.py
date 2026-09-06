@@ -46,6 +46,7 @@ WEMOD_URL = "https://storage-cdn.wemod.com/app/releases/stable/WeMod-%s-full.nup
 WEMOD_SHA256 = "5b94ae5592e698b13cbc06fae4c096fe2438cbd362daac3f842e13190bf836ba"
 WEMOD_DIR = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
              / "coproton" / ("wemod-" + WEMOD_VERSION))
+WEMOD_PROFILE = WEMOD_DIR.parent / "wemod-profile"
 
 
 # ------------------------------------------------------------------ discovery
@@ -427,8 +428,11 @@ def unpack_wemod(package, dest):
     return str(dest / "WeMod.exe")
 
 
-def install_wemod(report=print):
-    """Download the pinned WeMod build and unpack it. Returns the exe path, or None."""
+def install_wemod(report=print, stop=None):
+    """Download the pinned WeMod build and unpack it. Returns the exe path, or None.
+
+    stop is an optional threading.Event: setting it abandons the download.
+    """
     import hashlib
     import tempfile
     import urllib.request
@@ -443,6 +447,9 @@ def install_wemod(report=print):
                 total = int(response.headers.get("Content-Length") or 0)
                 done = 0
                 for chunk in iter(lambda: response.read(1 << 20), b""):
+                    if stop is not None and stop.is_set():
+                        report("download cancelled")
+                        return None
                     tmp.write(chunk)
                     digest.update(chunk)
                     done += len(chunk)
@@ -463,6 +470,40 @@ def install_wemod(report=print):
             pass
     report("WeMod %s is ready" % WEMOD_VERSION)
     return exe
+
+
+def share_wemod_profile(report=print):
+    """Point this prefix's WeMod profile at one shared copy. Returns True when linked.
+
+    WeMod keeps an Electron profile inside the prefix, and every game has its own prefix,
+    so the login would have to be typed again for every game. A symlink to one directory
+    under ~/.local/share gives all of them the same account. Only one game at a time may
+    use it: Chromium profiles hold locks on the files they open.
+    """
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if not data:
+        return False
+    profile = Path(data) / "pfx/drive_c/users/steamuser/AppData/Roaming/WeMod"
+    try:
+        if profile.is_symlink():
+            if profile.resolve() == WEMOD_PROFILE.resolve():
+                return True
+            profile.unlink()                       # Someone else's link, take it over.
+        elif profile.is_dir():
+            # The first prefix that already holds a login seeds the shared profile.
+            if WEMOD_PROFILE.exists():
+                shutil.rmtree(profile)
+            else:
+                WEMOD_PROFILE.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(profile), str(WEMOD_PROFILE))
+        WEMOD_PROFILE.mkdir(parents=True, exist_ok=True)
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.symlink_to(WEMOD_PROFILE)
+    except OSError as exc:                         # Never let this stop the launch.
+        report("could not share the WeMod profile: %s" % exc)
+        return False
+    report("WeMod profile shared from %s" % WEMOD_PROFILE)
+    return True
 
 
 def deref_symlinks(win_dir, report=print):
@@ -631,6 +672,8 @@ def inner(argv):
     # Electron programs need --disable-gpu under wine, so the flags have to be settable.
     args = shlex.split(entry.get("args") or "")
     if program and Path(program).exists():
+        if program == wemod_exe():
+            share_wemod_profile(log)
         time.sleep(entry.get("delay", DEFAULT_DELAY))
         if game.poll() is None:
             log("starting %s" % program)
@@ -657,14 +700,86 @@ def inner(argv):
 
 # ------------------------------------------------------------------------- GUI
 
+# Where Omarchy keeps the colours of the theme in use, newest layout first.
+OMARCHY_COLORS = ("~/.local/state/omarchy/current/theme/colors.toml",
+                  "~/.config/omarchy/current/theme/colors.toml")
+# Tokyo Night, the Omarchy default, for machines that do not run Omarchy at all.
+FALLBACK_COLORS = {"background": "#1a1b26", "lighter_background": "#24283b",
+                   "foreground": "#c0caf5", "dark_foreground": "#565f89",
+                   "muted": "#414868", "accent": "#7aa2f7", "selection": "#33467c",
+                   "yellow": "#e0af68"}
+FONTS = ("CaskaydiaMono Nerd Font", "JetBrainsMono Nerd Font", "Noto Sans")
+
+
+def theme_colors():
+    """Colours of the current Omarchy theme, falling back to Tokyo Night."""
+    colors = dict(FALLBACK_COLORS)
+    for candidate in OMARCHY_COLORS:
+        try:
+            text = Path(candidate).expanduser().read_text()
+        except OSError:
+            continue
+        # colors.toml is flat `key = "#rrggbb"` lines, so no toml parser is needed.
+        colors.update(re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{3,8})"', text, re.M))
+        break
+    return colors
+
+
+def style_window(root, ttk, tkfont):
+    """Dress the window in the desktop's own colours. Returns the colours used."""
+    c = theme_colors()
+    bg, surface = c["background"], c.get("lighter_background", c["background"])
+    fg, dim = c["foreground"], c.get("dark_foreground", c["muted"])
+    accent, selection = c["accent"], c.get("selection", c["accent"])
+
+    installed = set(tkfont.families())
+    family = next((f for f in FONTS if f in installed), tkfont.nametofont("TkDefaultFont")["family"])
+    for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
+        tkfont.nametofont(name).configure(family=family, size=10)
+
+    style = ttk.Style(root)
+    style.theme_use("clam")            # The only stock theme whose colours can be set.
+    root.configure(background=bg)
+    style.configure(".", background=bg, foreground=fg, fieldbackground=surface,
+                    bordercolor=surface, lightcolor=surface, darkcolor=surface,
+                    troughcolor=surface, arrowcolor=fg, insertcolor=fg,
+                    focuscolor=accent, borderwidth=0)
+    style.configure("TLabel", padding=(0, 2))
+    style.configure("Title.TLabel", foreground=accent, font=(family, 13, "bold"))
+    style.configure("Hint.TLabel", foreground=c.get("yellow", accent))
+    for widget in ("TEntry", "TCombobox", "TSpinbox"):
+        style.configure(widget, padding=6, insertwidth=1)
+        style.map(widget, fieldbackground=[("readonly", surface), ("disabled", bg)],
+                  foreground=[("disabled", dim)], arrowcolor=[("", accent)])
+    style.configure("TButton", padding=(14, 7), background=surface, relief="flat")
+    style.map("TButton", background=[("active", selection), ("disabled", bg)],
+              foreground=[("disabled", dim)])
+    # The primary action gets the accent, the way the rest of the desktop marks one.
+    style.configure("Accent.TButton", background=accent, foreground=bg)
+    style.map("Accent.TButton", background=[("active", selection), ("disabled", surface)],
+              foreground=[("disabled", dim)])
+    style.configure("TCheckbutton", padding=(0, 4), indicatorsize=13, indicatormargin=(0, 0, 8, 0),
+                    indicatorbackground=surface, indicatorforeground=bg)
+    style.map("TCheckbutton", indicatorbackground=[("selected", accent), ("active", selection)],
+              indicatorforeground=[("selected", bg)])
+    style.configure("TProgressbar", background=accent, troughcolor=surface, thickness=6)
+    # The combobox popup is a plain Tk listbox and only listens to the option database.
+    for option, value in (("background", surface), ("foreground", fg),
+                          ("selectBackground", accent), ("selectForeground", bg)):
+        root.option_add("*TCombobox*Listbox." + option, value)
+    return c
+
+
 def gui(appid=None, launch=False):
     """Configuration window. Returns "cancel", "save" or "run".
 
     tkinter is imported here and nowhere else: the launch path must keep working on
     machines without it, and inside the runtime container it does not exist at all.
     """
+    import queue as queuelib
+    import threading
     import tkinter as tk
-    from tkinter import ttk, filedialog
+    from tkinter import font as tkfont, ttk, filedialog
 
     all_games, all_protons = games(), protons()
     cfg = load()
@@ -679,21 +794,27 @@ def gui(appid=None, launch=False):
 
     root = tk.Tk()
     root.title("Coproton")
-    root.minsize(560, 0)
-    frame = ttk.Frame(root, padding=14)
+    root.minsize(620, 0)
+    style_window(root, ttk, tkfont)
+    frame = ttk.Frame(root, padding=20)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)      # A tiling WM hands out more space than we asked for.
     frame.columnconfigure(1, weight=1)
     result = {"action": "cancel"}
     row = 0
 
     def add(text, widget, extra_widget=None):
         nonlocal row
-        ttk.Label(frame, text=text).grid(row=row, column=0, sticky="w", pady=(0, 8), padx=(0, 10))
-        widget.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        ttk.Label(frame, text=text).grid(row=row, column=0, sticky="w", pady=(0, 10), padx=(0, 14))
+        widget.grid(row=row, column=1, sticky="ew", pady=(0, 10))
         if extra_widget is not None:
-            extra_widget.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(0, 8))
+            extra_widget.grid(row=row, column=2, sticky="w", padx=(10, 0), pady=(0, 10))
         row += 1
+
+    ttk.Label(frame, text="Coproton", style="Title.TLabel").grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(0, 16))
+    row += 1
 
     game_var = tk.StringVar()
     game_box = ttk.Combobox(frame, textvariable=game_var, state="readonly",
@@ -724,19 +845,22 @@ def gui(appid=None, launch=False):
 
     def use_wemod():
         """Fetch WeMod on first use, then point the Program field at it."""
+        def picked(exe):
+            if exe:
+                program_var.set(exe)
+                dotnet_var.set(True)   # The net45 build needs the framework, not wine-mono.
+                refresh_hint()
         exe = wemod_exe()
-        if not exe:
-            hint.config(text="Setting up WeMod, this downloads about 160 MB...")
-            root.update()
-            exe = install_wemod(report=lambda m: (hint.config(text=m), root.update()))
         if exe:
-            program_var.set(exe)
-            dotnet_var.set(True)   # The net45 build needs the real framework, not wine-mono.
-            refresh_hint()
+            picked(exe)
+            return
+        run_busy("Setting up WeMod, this downloads about 160 MB...",
+                 lambda report, stop: install_wemod(report=report, stop=stop),
+                 picked, cancellable=True)
 
     program_buttons = ttk.Frame(frame)
     ttk.Button(program_buttons, text="Browse...", command=browse).grid(row=0, column=0)
-    ttk.Button(program_buttons, text="WeMod", command=use_wemod).grid(row=0, column=1, padx=(6, 0))
+    ttk.Button(program_buttons, text="WeMod", command=use_wemod).grid(row=0, column=1, padx=(8, 0))
     add("Program", program_entry, program_buttons)
 
     dotnet_var = tk.BooleanVar()
@@ -750,8 +874,14 @@ def gui(appid=None, launch=False):
     delay_var = tk.StringVar(value=str(DEFAULT_DELAY))
     add("Delay, seconds", ttk.Spinbox(frame, from_=0, to=600, textvariable=delay_var, width=8))
 
-    hint = ttk.Label(frame, text="", wraplength=520, foreground="#b06000")
-    hint.grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 10))
+    spinner = ttk.Progressbar(frame, mode="indeterminate")
+    spinner.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+    spinner.grid_remove()        # Keeps the row; the bar only shows while a job runs.
+    row += 1
+
+    hint = ttk.Label(frame, text="", wraplength=560, style="Hint.TLabel")
+    hint.grid(row=row, column=0, columnspan=3, sticky="nw", pady=(2, 12))
+    frame.rowconfigure(row, weight=1)   # Spare height goes here, keeping the buttons down.
     row += 1
 
     def current_game():
@@ -796,7 +926,65 @@ def gui(appid=None, launch=False):
     program_var.trace_add("write", lambda *_: refresh_hint())
     dotnet_var.trace_add("write", lambda *_: refresh_hint())
 
+    busy = {"stop": None}
+
+    def set_busy(stop):
+        """Lock the window while a job runs. stop is None when nothing is running."""
+        running = stop is not None
+        busy["stop"] = stop
+        save_button.state(["disabled"] if running else ["!disabled"])
+        run_button.state(["disabled"] if running or not launch else ["!disabled"])
+        # Cancel doubles as the stop button, but only for jobs that can be stopped.
+        cancel_button.state(["disabled"] if running and not stop.settable else ["!disabled"])
+        cancel_button.config(text="Stop" if running and stop.settable else "Cancel")
+        root.config(cursor="watch" if running else "")
+        if running:
+            spinner.grid()
+            spinner.start(12)
+        else:
+            spinner.stop()
+            spinner.grid_remove()
+
+    def run_busy(message, work, done, cancellable=False):
+        """Run work(report, stop) on a worker thread and keep the window alive.
+
+        Tk is not thread safe, so the worker only puts text on a queue; the window is
+        touched from the Tk thread alone, by the poller below.
+        """
+        stop = threading.Event()
+        stop.settable = cancellable        # Whether Cancel may interrupt this job.
+        messages = queuelib.Queue()
+        outcome = {}
+
+        def worker():
+            try:
+                outcome["value"] = work(messages.put, stop)
+            except Exception as exc:       # A crash must not leave the window locked.
+                outcome["error"] = exc
+            messages.put(None)
+
+        def poll():
+            while True:
+                try:
+                    message = messages.get_nowait()
+                except queuelib.Empty:
+                    root.after(100, poll)
+                    return
+                if message is None:
+                    set_busy(None)
+                    if "error" in outcome:
+                        hint.config(text="Failed: %s" % outcome["error"])
+                    done(outcome.get("value"))
+                    return
+                hint.config(text=message)
+
+        hint.config(text=message)
+        set_busy(stop)
+        threading.Thread(target=worker, daemon=True).start()
+        poll()
+
     def store():
+        """Write the fields into the config. Returns the game id, or None."""
         gid = current_game()
         if not gid:
             hint.config(text="Pick a game first.")
@@ -812,28 +1000,52 @@ def gui(appid=None, launch=False):
         if was != entry["dotnet"]:
             entry.pop("dotnet_done", None)
         save(cfg)
-        if entry["dotnet"] and not entry.get("dotnet_done"):
-            hint.config(text="Installing .NET, the window will stay busy for a few minutes...")
-            root.update()
-            # .NET goes into the prefix with the wine of whichever Proton will run it.
-            if install_dotnet(resolve_proton(entry)[0], gid,
-                              report=lambda m: (hint.config(text=m), root.update())):
-                entry["dotnet_done"] = True
-                save(cfg)
         return gid
 
-    def finish(action):
-        if action != "cancel" and store() is None:
-            return
+    def close(action):
         result["action"] = action
         root.destroy()
 
+    def finish(action):
+        if action == "cancel":
+            close(action)
+            return
+        gid = store()
+        if gid is None:
+            return
+        entry = cfg[gid]
+        if entry["dotnet"] and not entry.get("dotnet_done"):
+            proton = resolve_proton(entry)[0]
+
+            def installed(ok):
+                if ok:
+                    entry["dotnet_done"] = True
+                    save(cfg)
+                close(action)      # A failed install is in the log; the launch goes ahead.
+
+            # .NET goes into the prefix with the wine of whichever Proton will run it.
+            run_busy("Installing .NET, this takes a few minutes...",
+                     lambda report, stop: install_dotnet(proton, gid, report=report),
+                     installed)
+            return
+        close(action)
+
+    def cancel_clicked():
+        stop = busy["stop"]
+        if stop is None:
+            finish("cancel")
+        elif stop.settable:
+            stop.set()
+
     buttons = ttk.Frame(frame)
     buttons.grid(row=row, column=0, columnspan=3, sticky="e")
-    ttk.Button(buttons, text="Cancel", command=lambda: finish("cancel")).grid(row=0, column=0, padx=4)
-    ttk.Button(buttons, text="Save", command=lambda: finish("save")).grid(row=0, column=1, padx=4)
-    run_button = ttk.Button(buttons, text="Save and Run", command=lambda: finish("run"))
-    run_button.grid(row=0, column=2, padx=4)
+    cancel_button = ttk.Button(buttons, text="Cancel", command=cancel_clicked)
+    cancel_button.grid(row=0, column=0, padx=4)
+    save_button = ttk.Button(buttons, text="Save", command=lambda: finish("save"))
+    save_button.grid(row=0, column=1, padx=4)
+    run_button = ttk.Button(buttons, text="Save and Run", style="Accent.TButton",
+                            command=lambda: finish("run"))
+    run_button.grid(row=0, column=2, padx=(4, 0))
     if not launch:
         run_button.state(["disabled"])            # Nothing to run outside a Steam launch.
 
@@ -844,7 +1056,8 @@ def gui(appid=None, launch=False):
         game_var.set(label(order[0]))
     load_game()
 
-    root.bind("<Escape>", lambda *_: finish("cancel"))
+    root.bind("<Escape>", lambda *_: cancel_clicked())
+    root.protocol("WM_DELETE_WINDOW", cancel_clicked)
     root.eval("tk::PlaceWindow . center")
     root.mainloop()
     return result["action"]
@@ -987,6 +1200,73 @@ def check_wemod_unpack():
             pass
 
 
+def check_wemod_profile():
+    """One shared profile: the first prefix seeds it, the next one just links to it."""
+    global WEMOD_PROFILE
+    import tempfile
+    kept_profile, kept_env = WEMOD_PROFILE, os.environ.get("STEAM_COMPAT_DATA_PATH")
+    quiet = lambda *_: None
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        WEMOD_PROFILE = tmp / "shared"
+
+        def roaming(name, contents=None):
+            pfx = tmp / name
+            wemod = pfx / "pfx/drive_c/users/steamuser/AppData/Roaming/WeMod/App"
+            if contents is not None:
+                wemod.mkdir(parents=True)
+                (wemod / "init.json").write_text(contents)
+            os.environ["STEAM_COMPAT_DATA_PATH"] = str(pfx)
+            return wemod.parent
+
+        try:
+            first = roaming("one", '{"login": "yes"}')
+            assert share_wemod_profile(quiet), "the first prefix should link"
+            assert first.is_symlink(), "the profile was not replaced by a link"
+            assert (WEMOD_PROFILE / "App/init.json").read_text() == '{"login": "yes"}', \
+                "the existing login should seed the shared profile"
+
+            second = roaming("two", "{}")            # A second game, its own throwaway login.
+            assert share_wemod_profile(quiet), "the second prefix should link"
+            assert second.is_symlink() and second.resolve() == WEMOD_PROFILE.resolve()
+            assert (WEMOD_PROFILE / "App/init.json").read_text() == '{"login": "yes"}', \
+                "the shared login must not be overwritten by a later prefix"
+
+            assert share_wemod_profile(quiet), "linking again must be a no-op"
+            third = roaming("three")                 # A prefix WeMod has never run in.
+            assert share_wemod_profile(quiet) and third.is_symlink()
+
+            os.environ.pop("STEAM_COMPAT_DATA_PATH")
+            assert not share_wemod_profile(quiet), "outside a launch there is no prefix"
+        finally:
+            WEMOD_PROFILE = kept_profile
+            os.environ.pop("STEAM_COMPAT_DATA_PATH", None)
+            if kept_env is not None:
+                os.environ["STEAM_COMPAT_DATA_PATH"] = kept_env
+
+
+def check_theme():
+    """Colours come out of the desktop's own flat colors.toml, or Tokyo Night if absent."""
+    global OMARCHY_COLORS
+    import tempfile
+    kept = OMARCHY_COLORS
+    with tempfile.TemporaryDirectory() as tmp:
+        palette = Path(tmp) / "colors.toml"
+        palette.write_text('mode = "dark"\n\naccent = "#d32f2f"\n'
+                           'background = "#121212"\nfont = "JetBrainsMono"\n')
+        try:
+            OMARCHY_COLORS = (str(Path(tmp) / "missing.toml"), str(palette))
+            colors = theme_colors()
+            assert colors["accent"] == "#d32f2f" and colors["background"] == "#121212"
+            assert "font" not in colors, "only colours may be picked up"
+            # Keys the theme does not define keep their default.
+            assert colors["foreground"] == FALLBACK_COLORS["foreground"]
+            OMARCHY_COLORS = (str(Path(tmp) / "missing.toml"),)
+            assert theme_colors() == FALLBACK_COLORS, "no theme means the built-in palette"
+        finally:
+            OMARCHY_COLORS = kept
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -1059,6 +1339,8 @@ def selftest():
     check_steam_settings()
     check_deref()
     check_wemod_unpack()
+    check_wemod_profile()
+    check_theme()
     check_winver()
     check_shortcuts()
     check_launch()
