@@ -51,6 +51,16 @@ Steam Deck, Bazzite and other immutable distros.
 3. **Cancel** aborts the launch, **Save** stores the settings without starting the game,
    **Save and Run** starts the game.
 
+Every button carries a tooltip saying what it does, and long jobs (the .NET install, the
+WeMod download) run in the background: the buttons lock, a bar spins, and **Cancel** turns
+into **Stop** for anything that can be abandoned.
+
+**Run in prefix...** picks a program and runs it in the selected game's wine prefix straight
+away, with no game and no launch: a patcher, a mod installer, a redistributable, a
+configuration tool. It uses the wine of the Proton selected above, so the prefix has to exist
+already — start the game once if it does not. Whatever the program prints goes to
+`~/.config/coproton/last.log`.
+
 The same window opens from the application menu (or by running `coproton`) to edit settings
 without launching anything. There **Save and Run** is disabled, since there is no game to run.
 

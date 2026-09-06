@@ -534,6 +534,43 @@ def deref_symlinks(win_dir, report=print):
     return replaced
 
 
+def run_in_prefix(proton, appid, program, args=(), report=print, stop=None):
+    """Run one program in the game's prefix, with no game. Returns True on exit code 0.
+
+    For patchers, mod installers, config tools and the like: they have to see the same
+    wine prefix the game runs in, and waiting for a launch to do that is silly.
+    """
+    pfx, wine = prefix_path(appid), wine_bin(proton)
+    if not pfx or not (pfx / "pfx" / "system.reg").exists():
+        report("no prefix yet, start the game once and try again")
+        return False
+    if not wine:
+        report("no wine binary in the selected Proton")
+        return False
+    env = dict(os.environ, WINEPREFIX=str(pfx / "pfx"),
+               WINESERVER=wine_bin(proton, "wineserver") or "", WINEDEBUG="-all")
+    name = Path(program).name
+    report("running %s in the prefix..." % name)
+    try:
+        # Output is kept: a patcher that refuses to start says why here and nowhere else.
+        with LOG.open("a") as out:
+            running = subprocess.Popen([wine, program, *args], env=env,
+                                       cwd=str(Path(program).parent),
+                                       stdout=out, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        report("could not start %s: %s" % (name, exc))
+        return False
+    while running.poll() is None:
+        if stop is not None and stop.is_set():
+            running.terminate()
+            report("%s stopped" % name)
+            return False
+        time.sleep(0.2)
+    report("%s finished" % name if not running.returncode
+           else "%s exited with %d, see the log" % (name, running.returncode))
+    return running.returncode == 0
+
+
 def install_dotnet(proton, appid, report=print):
     """winetricks -q dotnet48 into the game prefix, using wine from the chosen Proton.
 
@@ -759,6 +796,7 @@ def style_window(root, ttk, tkfont):
     style.configure("TLabel", padding=(0, 2))
     style.configure("Title.TLabel", foreground=accent, font=(family, 13, "bold"))
     style.configure("Hint.TLabel", foreground=c.get("yellow", accent))
+    style.configure("Tip.TLabel", background=surface, foreground=fg, padding=(9, 6))
     for widget in ("TEntry", "TCombobox", "TSpinbox"):
         style.configure(widget, padding=6, insertwidth=1)
         style.map(widget, fieldbackground=[("readonly", surface), ("disabled", bg)],
@@ -807,7 +845,7 @@ def gui(appid=None, launch=False):
     root = tk.Tk()
     root.title("Coproton")
     root.minsize(620, 0)
-    style_window(root, ttk, tkfont)
+    colors = style_window(root, ttk, tkfont)
     frame = ttk.Frame(root, padding=20)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
@@ -815,6 +853,36 @@ def gui(appid=None, launch=False):
     frame.columnconfigure(1, weight=1)
     result = {"action": "cancel"}
     row = 0
+
+    def tooltip(widget, text):
+        """Tk has no tooltips, and this is the smallest thing that behaves like one."""
+        tip = {"window": None, "timer": None}
+
+        def show():
+            win = tk.Toplevel(root)
+            win.overrideredirect(True)
+            win.configure(background=colors["accent"])        # Serves as a 1px border.
+            ttk.Label(win, text=text, style="Tip.TLabel", wraplength=340).pack(padx=1, pady=1)
+            win.geometry("+%d+%d" % (widget.winfo_rootx(),
+                                     widget.winfo_rooty() + widget.winfo_height() + 6))
+            tip["window"] = win
+
+        def enter(_=None):
+            hide()
+            tip["timer"] = widget.after(450, show)
+
+        def hide(_=None):
+            if tip["timer"]:
+                widget.after_cancel(tip["timer"])
+                tip["timer"] = None
+            if tip["window"]:
+                tip["window"].destroy()
+                tip["window"] = None
+
+        widget.bind("<Enter>", enter, add="+")
+        widget.bind("<Leave>", hide, add="+")
+        widget.bind("<ButtonPress>", hide, add="+")
+        root.bind("<Destroy>", hide, add="+")
 
     def add(text, widget, extra_widget=None):
         nonlocal row
@@ -871,9 +939,15 @@ def gui(appid=None, launch=False):
                  picked, cancellable=True)
 
     program_buttons = ttk.Frame(frame)
-    ttk.Button(program_buttons, text="Browse...", command=browse).grid(row=0, column=0)
-    ttk.Button(program_buttons, text="WeMod", command=use_wemod).grid(row=0, column=1, padx=(8, 0))
+    browse_button = ttk.Button(program_buttons, text="Browse...", command=browse)
+    browse_button.grid(row=0, column=0)
+    wemod_button = ttk.Button(program_buttons, text="WeMod", command=use_wemod)
+    wemod_button.grid(row=0, column=1, padx=(8, 0))
     add("Program", program_entry, program_buttons)
+    tooltip(browse_button, "Pick the program to start together with the game: a trainer, "
+                           "an overlay, anything that has to share the game's prefix.")
+    tooltip(wemod_button, "Download WeMod and use it as that program. It needs the real "
+                          ".NET Framework, so the box below is ticked for it.")
 
     dotnet_var = tk.BooleanVar()
     ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix (rarely needed)",
@@ -895,6 +969,10 @@ def gui(appid=None, launch=False):
     hint.grid(row=row, column=0, columnspan=3, sticky="nw", pady=(2, 12))
     frame.rowconfigure(row, weight=1)   # Spare height goes here, keeping the buttons down.
     row += 1
+
+    def chosen_proton():
+        picked = proton_var.get()
+        return "" if picked == follow else all_protons.get(picked, "")
 
     def current_game():
         picked = game_var.get()
@@ -945,6 +1023,7 @@ def gui(appid=None, launch=False):
         running = stop is not None
         busy["stop"] = stop
         save_button.state(["disabled"] if running else ["!disabled"])
+        patch_button.state(["disabled"] if running else ["!disabled"])
         run_button.state(["disabled"] if running or not launch else ["!disabled"])
         # Cancel doubles as the stop button, but only for jobs that can be stopped.
         cancel_button.state(["disabled"] if running and not stop.settable else ["!disabled"])
@@ -1003,8 +1082,7 @@ def gui(appid=None, launch=False):
             return None
         entry = cfg.setdefault(gid, {})
         was = entry.get("dotnet")
-        picked = proton_var.get()
-        entry.update(proton="" if picked == follow else all_protons.get(picked, ""),
+        entry.update(proton=chosen_proton(),
                      program=unquote_path(program_var.get()),
                      dotnet=dotnet_var.get(),
                      args=args_var.get().strip(),
@@ -1042,6 +1120,28 @@ def gui(appid=None, launch=False):
             return
         close(action)
 
+    def run_patcher():
+        """Run a patcher or installer in the game's prefix, without starting the game."""
+        gid = current_game()
+        if not gid:
+            hint.config(text="Pick a game first.")
+            return
+        start = all_games.get(gid, {}).get("dir") or str(Path.home())
+        chosen = filedialog.askopenfilename(
+            parent=root, title="Run a program in the game's prefix",
+            initialdir=start if Path(start).is_dir() else str(Path.home()),
+            filetypes=[("Windows executables", "*.exe"), ("All files", "*")])
+        if not chosen:
+            return
+        proton = resolve_proton({"proton": chosen_proton()})[0]
+        if not proton:
+            hint.config(text="No Proton found.")
+            return
+        run_busy("Starting %s..." % Path(chosen).name,
+                 lambda report, stop: run_in_prefix(proton, gid, unquote_path(chosen),
+                                                    report=report, stop=stop),
+                 lambda _: None, cancellable=True)
+
     def cancel_clicked():
         stop = busy["stop"]
         if stop is None:
@@ -1049,8 +1149,10 @@ def gui(appid=None, launch=False):
         elif stop.settable:
             stop.set()
 
+    patch_button = ttk.Button(frame, text="Run in prefix...", command=run_patcher)
+    patch_button.grid(row=row, column=0, sticky="w")
     buttons = ttk.Frame(frame)
-    buttons.grid(row=row, column=0, columnspan=3, sticky="e")
+    buttons.grid(row=row, column=1, columnspan=2, sticky="e")
     cancel_button = ttk.Button(buttons, text="Cancel", command=cancel_clicked)
     cancel_button.grid(row=0, column=0, padx=4)
     save_button = ttk.Button(buttons, text="Save", command=lambda: finish("save"))
@@ -1060,6 +1162,17 @@ def gui(appid=None, launch=False):
     run_button.grid(row=0, column=2, padx=(4, 0))
     if not launch:
         run_button.state(["disabled"])            # Nothing to run outside a Steam launch.
+
+    tooltip(patch_button, "Pick a program and run it in this game's wine prefix right now, "
+                          "without starting the game: a patcher, a mod installer, a config "
+                          "tool. Its output goes to the log.")
+    tooltip(cancel_button, "Close without saving; the game is not started. While something "
+                           "is downloading it turns into Stop and abandons it.")
+    tooltip(save_button, "Save these settings for this game and close. The game is not "
+                         "started.")
+    tooltip(run_button, "Save and start the game with the program alongside it. Available "
+                        "only when Steam is launching the game." if not launch else
+                        "Save and start the game, with the program alongside it.")
 
     if appid and appid in all_games:
         game_var.set(label(appid))
@@ -1292,6 +1405,41 @@ def check_is_launch():
     assert not is_launch("getcompatpath", ["C:/windows"])
 
 
+def check_run_in_prefix():
+    """A patcher gets the game's prefix and the Proton's own wine, and no prefix says so."""
+    global prefix_path, LOG
+    import tempfile
+    kept_prefix, kept_log = prefix_path, LOG
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        wine, calls = tmp / "pt" / "files" / "bin" / "wine", tmp / "calls"
+        wine.parent.mkdir(parents=True)
+        wine.write_text('#!/bin/sh\necho "$@" >> "%s"\necho "$WINEPREFIX" >> "%s"\nexit 3\n'
+                        % (calls, calls))
+        wine.chmod(0o755)
+        proton = tmp / "pt" / "proton"
+        proton.touch()
+        pfx = tmp / "compatdata" / "1234"
+        (pfx / "pfx").mkdir(parents=True)
+        (pfx / "pfx" / "system.reg").touch()
+        patcher = tmp / "patch.exe"
+        patcher.touch()
+        LOG = tmp / "log"
+        quiet = lambda *_: None
+        try:
+            prefix_path = lambda appid: pfx
+            assert not run_in_prefix(str(proton), "1234", str(patcher), report=quiet), \
+                "a non-zero exit code is a failure"
+            lines = calls.read_text().splitlines()
+            assert lines[0] == str(patcher), lines
+            assert lines[1] == str(pfx / "pfx"), "the game's prefix must be used: %s" % lines
+            prefix_path = lambda appid: None
+            assert not run_in_prefix(str(proton), "1234", str(patcher), report=quiet), \
+                "without a prefix there is nothing to run in"
+        finally:
+            prefix_path, LOG = kept_prefix, kept_log
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -1367,6 +1515,7 @@ def selftest():
     check_wemod_profile()
     check_theme()
     check_is_launch()
+    check_run_in_prefix()
     check_winver()
     check_shortcuts()
     check_launch()
