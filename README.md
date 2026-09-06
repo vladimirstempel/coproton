@@ -71,6 +71,20 @@ the checkbox is off, so the silent failure becomes a visible one.
 The prefix has to exist first, so if the game has never been launched, start it once and then
 tick the box.
 
+Two things get in the way, and both are handled:
+
+* Proton pre-registers a .NET 4.7 that does not exist, so that programs checking for the
+  framework find one and then run on wine-mono. The real installer reads the same registry
+  keys, decides .NET is already present and quits silently, so those keys are removed first.
+* The `dotnet48` recipe switches the prefix to Windows XP and never switches it back, which
+  makes any modern game refuse D3D12 ("DirectX 12 is not supported on your system"). The
+  version is restored afterwards whether or not the install succeeded.
+
+One thing that is **not** handled: wine 11 fails to unpack the installer's cabinets
+(`err:msi:extract_cabinet FDICopy failed`), so the install cannot succeed under Proton builds
+based on it, including Proton Experimental and GE-Proton11. wine 10 unpacks them fine, so pick
+a GE-Proton10 build for the game and the install goes through.
+
 ## Configuration
 
 `~/.config/coproton/config.json`, keyed by AppID:
