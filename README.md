@@ -43,7 +43,10 @@ Steam Deck, Bazzite and other immutable distros.
      all other titles" has been turned on. When it is unset, the entry says so and the newest
      installed build is used instead.
    * **Program** — the executable to run alongside it, picked with a file dialog.
-   * **Install .NET 4.8** — most trainers are .NET applications and do nothing without it.
+   * **Install .NET 4.8** — rarely needed, see below. Proton's wine-mono already runs most
+     .NET programs, and installing .NET removes it.
+   * **Arguments** — passed to the program, split the way a shell would. Electron programs
+     usually need `--disable-gpu` under wine.
    * **Delay** — how long to wait after the game starts before launching the program.
 3. **Cancel** aborts the launch, **Save** stores the settings without starting the game,
    **Save and Run** starts the game.
@@ -61,29 +64,48 @@ launch, because for a non-Steam shortcut `SteamAppId` is `0`.
 
 ## The .NET checkbox
 
-Most trainers are .NET applications: without the runtime in the prefix they exit immediately
-and silently. Ticking the box runs `winetricks -q dotnet48` against the game's prefix, using
-the wine binary from the Proton build you picked, and records that it is done.
+**Usually you do not need it.** Proton ships wine-mono, and .NET programs, WPF ones included,
+normally run on it unchanged. Installing .NET removes wine-mono, so tick this only when a
+program genuinely refuses to start without the real framework.
 
-The window warns when the chosen executable imports `mscoree.dll` (that is, needs .NET) while
-the checkbox is off, so the silent failure becomes a visible one.
+When ticked, `winetricks -q dotnet48` runs against the game's prefix using the wine binary
+from the Proton build you picked. Three things get in the way, and all three are handled:
 
-The prefix has to exist first, so if the game has never been launched, start it once and then
-tick the box.
+* **Proton's symlinks.** Proton links system libraries into its own read-only directory. An
+  installer writing through such a link changes nothing and still reports success, which is
+  how a .NET install finishes while wine's own `mscoree.dll` stays in place and every managed
+  program keeps running on wine-mono. Those links are turned into real files first. The trick
+  comes from [wemod-launcher](https://github.com/DeckCheatz/wemod-launcher), which hit the
+  same wall.
+* **A .NET that does not exist.** Proton pre-registers .NET 4.7 under `NDP\v4` so that
+  programs checking for the framework find one. The real installer reads the same keys,
+  decides .NET is already present and quits silently, so they are removed first.
+* **The Windows version.** The `dotnet48` recipe switches the prefix to Windows XP and never
+  switches it back, which makes any modern game refuse D3D12 ("DirectX 12 is not supported on
+  your system"). It is restored afterwards whether or not the install succeeded.
 
-Two things get in the way, and both are handled:
+One thing is **not** handled: wine 11 fails to unpack the installer's cabinets
+(`err:msi:extract_cabinet FDICopy failed`), so nothing installs under Proton Experimental or
+GE-Proton11. wine 10 unpacks them fine, so pick a GE-Proton10 build when you need .NET.
 
-* Proton pre-registers a .NET 4.7 that does not exist, so that programs checking for the
-  framework find one and then run on wine-mono. The real installer reads the same registry
-  keys, decides .NET is already present and quits silently, so those keys are removed first.
-* The `dotnet48` recipe switches the prefix to Windows XP and never switches it back, which
-  makes any modern game refuse D3D12 ("DirectX 12 is not supported on your system"). The
-  version is restored afterwards whether or not the install succeeded.
+## When the program does not start
 
-One thing that is **not** handled: wine 11 fails to unpack the installer's cabinets
-(`err:msi:extract_cabinet FDICopy failed`), so the install cannot succeed under Proton builds
-based on it, including Proton Experimental and GE-Proton11. wine 10 unpacks them fine, so pick
-a GE-Proton10 build for the game and the install goes through.
+Read `~/.config/coproton/last.log` first. Everything the program prints on startup is captured
+there, and it usually names the cause outright.
+
+In order of how often it is the answer:
+
+1. **The prefix is dirty.** A prefix that winetricks has been through breaks in two ways at
+   once: it is left on Windows XP, so the game refuses D3D12, and wine-mono is gone, so
+   nothing managed runs. Move `steamapps/compatdata/<appid>` aside, let Proton build a fresh
+   one, and copy the saves back. This fixes more than it has any right to.
+2. **The delay is too short.** The program starts before the game exists and gives up. Raise
+   it under Advanced; 20 seconds suits an Unreal Engine title.
+3. **The Proton build.** Try another one. Prefix and build are worth changing one at a time,
+   not together.
+4. **The program is doing it deliberately.** Some trainers relaunch themselves to ask for
+   administrator rights, check for a debugger, and exit with code 0 when they dislike the
+   answer. The log shows a clean exit and no error, and there is nothing to fix on this side.
 
 ## Configuration
 

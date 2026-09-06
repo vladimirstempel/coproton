@@ -15,6 +15,7 @@ game and the program end up in one container, sharing one wine prefix.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -322,15 +323,6 @@ def unquote_path(value):
     return (value or "").strip().strip('"').strip("'").strip()
 
 
-def needs_dotnet(exe):
-    """True if the executable links the .NET runtime, so the prefix needs it too."""
-    try:
-        with open(exe, "rb") as f:
-            return b"mscoree.dll" in f.read(4 << 20).lower()
-    except OSError:
-        return False
-
-
 def wine_bin(proton, name="wine"):
     """Proton ships wine under files/ (current) or dist/ (older builds)."""
     base = Path(proton).parent
@@ -397,6 +389,30 @@ def prefix_winver(pfx, default="win10"):
     return WINVER_BUILDS.get(m.group(1), default) if m else default
 
 
+def deref_symlinks(win_dir, report=print):
+    """Replace file symlinks under drive_c/windows with real copies. Returns the count.
+
+    Proton symlinks system libraries into its own read-only directory. An installer that
+    writes through such a link changes nothing and reports success, which is how a .NET
+    install can finish and still leave wine's own mscoree.dll in place, sending every
+    managed program to wine-mono instead of the framework that was just installed.
+    Borrowed from DeckCheatz/wemod-launcher, which hit the same wall.
+    """
+    replaced = 0
+    for link in Path(win_dir).rglob("*"):
+        if not link.is_symlink() or link.is_dir():
+            continue                     # Directory links are part of the prefix layout.
+        try:
+            data = link.read_bytes() if link.exists() else None
+            link.unlink()
+            if data is not None:
+                link.write_bytes(data)
+            replaced += 1
+        except OSError as exc:
+            report("could not dereference %s: %s" % (link.name, exc))
+    return replaced
+
+
 def install_dotnet(proton, appid, report=print):
     """winetricks -q dotnet48 into the game prefix, using wine from the chosen Proton.
 
@@ -420,6 +436,11 @@ def install_dotnet(proton, appid, report=print):
                WINESERVER=wine_bin(proton, "wineserver") or "",
                WINEDLLOVERRIDES="mscoree=d",
                WINEDEBUG="-all")
+    # Real files first, or the installer writes through Proton's symlinks into nothing.
+    freed = deref_symlinks(pfx / "pfx" / "drive_c" / "windows", report)
+    if freed:
+        report("made %d linked system files real" % freed)
+
     # Proton pre-registers a .NET 4.7 that does not exist, so that apps checking for the
     # framework find one and then run on wine-mono. The real installer reads the same keys,
     # decides .NET is already present and quits without a word.
@@ -531,6 +552,8 @@ def inner(argv):
     game = subprocess.Popen([proton, verb, *cmd])
 
     program, extra = unquote_path(entry.get("program")), None
+    # Electron programs need --disable-gpu under wine, so the flags have to be settable.
+    args = shlex.split(entry.get("args") or "")
     if program and Path(program).exists():
         time.sleep(entry.get("delay", DEFAULT_DELAY))
         if game.poll() is None:
@@ -538,7 +561,7 @@ def inner(argv):
             try:
                 # Output is captured: a trainer that dies on startup used to fail silently.
                 with LOG.open("a") as out:
-                    extra = subprocess.Popen([proton, "runinprefix", program],
+                    extra = subprocess.Popen([proton, "runinprefix", program, *args],
                                              cwd=str(Path(program).parent),
                                              stdout=out, stderr=subprocess.STDOUT)
             except OSError as exc:
@@ -626,9 +649,12 @@ def gui(appid=None, launch=False):
     add("Program", program_entry, ttk.Button(frame, text="Browse...", command=browse))
 
     dotnet_var = tk.BooleanVar()
-    ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix",
+    ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix (rarely needed)",
                     variable=dotnet_var).grid(row=row, column=1, sticky="w", pady=(0, 8))
     row += 1
+
+    args_var = tk.StringVar()
+    add("Arguments", ttk.Entry(frame, textvariable=args_var))
 
     delay_var = tk.StringVar(value=str(DEFAULT_DELAY))
     add("Delay, seconds", ttk.Spinbox(frame, from_=0, to=600, textvariable=delay_var, width=8))
@@ -649,11 +675,16 @@ def gui(appid=None, launch=False):
         program = unquote_path(program_var.get())
         if program and not Path(program).exists():
             notes.append("The program path does not exist.")
-        elif program and needs_dotnet(program) and not dotnet_var.get():
-            notes.append("This program needs .NET, but the checkbox is off. "
-                         "It will silently fail to start.")
-        if not shutil.which("winetricks") and dotnet_var.get():
-            notes.append("winetricks is not installed, .NET cannot be installed.")
+        # Warn about ticking the box, not about leaving it alone: almost every .NET
+        # program runs on the wine-mono that Proton already ships, and installing .NET
+        # removes it.
+        if dotnet_var.get():
+            if not shutil.which("winetricks"):
+                notes.append("winetricks is not installed, .NET cannot be installed.")
+            else:
+                notes.append("Rarely needed: .NET programs, WPF included, normally run on "
+                             "the wine-mono Proton ships, and installing .NET removes it. "
+                             "Tick this only if the program fails without it.")
         hint.config(text="  ".join(notes))
 
     def load_game(*_):
@@ -663,6 +694,7 @@ def gui(appid=None, launch=False):
                        if chosen else follow)
         program_var.set(unquote_path(c.get("program")))
         dotnet_var.set(bool(c.get("dotnet")))
+        args_var.set(c.get("args", ""))
         delay_var.set(str(c.get("delay", DEFAULT_DELAY)))
         refresh_hint()
 
@@ -681,6 +713,7 @@ def gui(appid=None, launch=False):
         entry.update(proton="" if picked == follow else all_protons.get(picked, ""),
                      program=unquote_path(program_var.get()),
                      dotnet=dotnet_var.get(),
+                     args=args_var.get().strip(),
                      delay=int(delay_var.get() or 0))
         if was != entry["dotnet"]:
             entry.pop("dotnet_done", None)
@@ -798,6 +831,32 @@ def check_winver():
     assert prefix_winver(Path("/nonexistent")) == "win10", "a missing prefix must not raise"
 
 
+def check_deref():
+    """A link that an installer would write through becomes a real file it can replace."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "store").mkdir()
+        real = tmp / "store" / "mscoree.dll"
+        real.write_bytes(b"builtin")
+        win = tmp / "windows"
+        (win / "system32").mkdir(parents=True)
+        link = win / "system32" / "mscoree.dll"
+        link.symlink_to(real)
+        (win / "system32" / "plain.dll").write_bytes(b"already real")
+        (win / "linkdir").symlink_to(tmp / "store")   # Layout links must survive.
+        broken = win / "system32" / "gone.dll"
+        broken.symlink_to(tmp / "store" / "missing.dll")
+
+        assert deref_symlinks(win, report=lambda *_: None) == 2, "one file link, one broken"
+        assert not link.is_symlink() and link.read_bytes() == b"builtin"
+        assert not broken.exists(), "a broken link is dropped, not recreated"
+        assert (win / "linkdir").is_symlink(), "directory links are left alone"
+        # The point of it all: the copy can be replaced without touching the original.
+        link.write_bytes(b"microsoft")
+        assert real.read_bytes() == b"builtin", "the read-only original must be untouched"
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -817,16 +876,6 @@ def check_shortcuts():
     assert int(shortcut_appid({"exe": '"/x/g.exe"', "appname": "G"})) >= 0x80000000
 
 
-def check_dotnet_detection():
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        managed, native = Path(tmp) / "a.exe", Path(tmp) / "b.exe"
-        managed.write_bytes(b"MZ\x00\x00" + b"\x00" * 500 + b"mscoree.dll\x00")
-        native.write_bytes(b"MZ\x00\x00" + b"\x00" * 500 + b"KERNEL32.dll\x00")
-        assert needs_dotnet(managed), "a .NET trainer must be recognised"
-        assert not needs_dotnet(native)
-        assert not needs_dotnet(Path(tmp) / "missing.exe")
-
 
 def check_launch():
     """Game and program go to the same proton, and the game's exit code is propagated."""
@@ -845,7 +894,8 @@ def check_launch():
         CONFIG, LOG = tmp / "config.json", tmp / "log"
         # A quoted path, exactly as the old GUI used to store it.
         save({"3755078775": {"proton": str(stub),
-                             "program": '"%s"' % (tmp / "trainer.exe"), "delay": 0}})
+                             "program": '"%s"' % (tmp / "trainer.exe"),
+                             "args": "--disable-gpu --flag=a b", "delay": 0}})
         os.environ.update(SteamAppId="0", STEAM_COMPAT_DATA_PATH=str(tmp / "3755078775"))
         os.environ.pop("COPROTON_PROTON", None)
         try:
@@ -866,8 +916,10 @@ def check_launch():
     # Sorted, not in call order: with delay 0 both stubs append concurrently.
     assert len(lines) == 3, lines
     assert lines[0] == "getcompatpath /games/game.exe", lines
-    assert lines[1].startswith("runinprefix ") and lines[1].endswith("trainer.exe"), lines
+    assert lines[1].startswith("runinprefix ") and "trainer.exe" in lines[1], lines
     assert '"' not in lines[1], "the quoted path must be cleaned before use: %s" % lines[1]
+    # Electron programs need flags like --disable-gpu, split the way a shell would.
+    assert lines[1].endswith("--disable-gpu --flag=a b"), lines[1]
     assert lines[2] == "waitforexitandrun /games/game.exe -windowed", lines
 
 
@@ -875,9 +927,9 @@ def selftest():
     check_parsers()
     check_runtime_manifest()
     check_steam_settings()
+    check_deref()
     check_winver()
     check_shortcuts()
-    check_dotnet_detection()
     check_launch()
     for name, path in protons().items():   # Real environment, when there is one.
         assert os.access(path, os.X_OK), name
