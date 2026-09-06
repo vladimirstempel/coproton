@@ -34,6 +34,10 @@ NOT_A_GAME = re.compile(r"^(Proton|Steam Linux Runtime|Steamworks|SteamVR|.*Redi
 # Verbs that actually start the game. Steam also asks for paths, and those must not
 # spawn anything.
 LAUNCH_VERBS = ("run", "waitforexitandrun")
+# Steam pushes its own housekeeping through the compat tool with a launch verb, once per
+# Steam game, right before the game itself. Without this the window opened twice and the
+# program started twice. Non-Steam shortcuts have no install script, hence no second run.
+STEAM_HELPERS = ("iscriptevaluator.exe",)
 DEFAULT_DELAY = 10
 
 # WeMod ships as a NuGet package, so unpacking lib/net45 gives a portable copy with no
@@ -600,6 +604,13 @@ def log(msg):
         pass
 
 
+def is_launch(verb, cmd):
+    """Whether this invocation is the game starting, rather than a Steam chore."""
+    if verb not in LAUNCH_VERBS:
+        return False
+    return not any(Path(part).name.lower() in STEAM_HELPERS for part in cmd)
+
+
 def current_appid():
     """The compatdata directory name is the authoritative appid.
 
@@ -617,7 +628,7 @@ def outer(argv):
     appid = current_appid()
     entry = load().get(appid, {})
 
-    if verb in LAUNCH_VERBS:
+    if is_launch(verb, cmd):
         action = "run"
         try:
             action = gui(appid=appid, launch=True)
@@ -661,8 +672,9 @@ def inner(argv):
     if not proton:
         sys.exit("[coproton] no Proton found")
 
-    if verb not in LAUNCH_VERBS:
-        # Steam also asks for paths. Answer and start nothing.
+    if not is_launch(verb, cmd):
+        # Steam also asks for paths and runs its install-script evaluator through us.
+        # Answer, and start nothing alongside it.
         return subprocess.run([proton, verb, *cmd]).returncode
 
     log("appid=%s proton=%s" % (appid or "?", Path(proton).parent.name))
@@ -1267,6 +1279,19 @@ def check_theme():
             OMARCHY_COLORS = kept
 
 
+def check_is_launch():
+    """Command lines taken from a real Steam launch: the game counts, the chore does not."""
+    evaluator = ["/home/ds/.local/share/Steam/legacycompat/iscriptevaluator.exe",
+                 "legacycompat\\evaluatorscript_1693980.vdf"]
+    assert not is_launch("run", evaluator), "the install script evaluator is not a launch"
+    game = "/mnt/d/SteamLibrary/steamapps/common/Dead Space (2023)/Dead Space.exe"
+    assert is_launch("waitforexitandrun", [game])
+    # Some games are started through a handler URL rather than a path.
+    assert is_launch("waitforexitandrun", ["link2ea://launchgame/1238860?platform=steam"])
+    assert is_launch("run", ["/games/trainer.exe"]), "the run verb still starts things"
+    assert not is_launch("getcompatpath", ["C:/windows"])
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -1341,6 +1366,7 @@ def selftest():
     check_wemod_unpack()
     check_wemod_profile()
     check_theme()
+    check_is_launch()
     check_winver()
     check_shortcuts()
     check_launch()
