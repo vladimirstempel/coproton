@@ -1,5 +1,8 @@
 # Coproton
 
+<img width="1280" height="705" alt="image" src="https://github.com/user-attachments/assets/444960e6-81b7-424f-a46a-4a3f8760f69d" />
+
+
 Runs a Steam game together with an arbitrary Windows program (a trainer, an overlay, anything)
 **inside the same wine prefix**, and therefore under the same `wineserver`. That shared
 wineserver is what lets a trainer reach the game's memory.
