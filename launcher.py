@@ -739,6 +739,13 @@ def inner(argv):
                                              stdout=out, stderr=subprocess.STDOUT)
             except OSError as exc:
                 log("could not start the program: %s" % exc)
+            if extra is not None:
+                # A program that dies at once used to leave nothing but "starting" in the
+                # log. The usual cause is a prefix the game is still building.
+                time.sleep(2)
+                if extra.poll() is not None:
+                    log("the program exited immediately with %d, the prefix may still be "
+                        "under construction: raise the delay and try again" % extra.returncode)
         else:
             log("game exited before the program could start")
     elif program:
