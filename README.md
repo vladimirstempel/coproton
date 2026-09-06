@@ -107,6 +107,16 @@ Two things are deliberate:
 It needs the real .NET Framework, so the prefix has to go through the .NET install described
 above, which in turn means a Proton built on wine 10.
 
+**Non-Steam games have to be added inside WeMod by hand.** WeMod does not find them on its
+own: open its game list, use *Add game* and point it at the game's `.exe`. Games installed
+through Steam are usually detected.
+
+**The login is shared between games.** WeMod keeps its account in the wine prefix, and every
+game has its own prefix, so it would ask for the login again for every game. Coproton keeps
+one profile in `~/.local/share/coproton/wemod-profile` and links it into each prefix the first
+time WeMod starts there, so signing in once is enough. Run one game at a time: two copies of
+WeMod on the same profile will fight over the file locks.
+
 `vkd3d` and `dxvk2030`, which [wemod-launcher](https://github.com/DeckCheatz/wemod-launcher)
 installs, are **not** needed. They were tried and reverted: they change nothing for WeMod, and
 the leftover `libvkd3d-*.dll` they leave behind coincided with the game dying on a
