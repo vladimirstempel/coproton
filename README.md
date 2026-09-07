@@ -6,8 +6,8 @@ Runs a Steam game together with an arbitrary Windows program (a trainer, an over
 **inside the same wine prefix**, and therefore under the same `wineserver`. That shared
 wineserver is what lets a trainer reach the game's memory.
 
-Like Steam Tinker Launch, but three fields and a checkbox. Press Play in Steam, a small window
-appears, you pick what to run alongside the game, and the game starts.
+Like Steam Tinker Launch, but one small window. Press Play in Steam, pick what should run
+alongside the game, and the game starts.
 
 ## Install
 
@@ -204,13 +204,21 @@ In order of how often it is the answer:
 {
   "2456085599": {
     "proton": "/mnt/d/SteamLibrary/steamapps/common/Proton - Experimental/proton",
-    "program": "/mnt/d/Games/Trainers/Trainer.exe",
+    "programs": [
+      {"path": "/mnt/d/Games/Trainers/Trainer.exe", "args": ""},
+      {"path": "/home/you/.local/share/coproton/wemod-11.6.0/WeMod.exe",
+       "args": "--disable-gpu"}
+    ],
     "dotnet": true,
     "delay": 10,
     "dotnet_done": true
   }
 }
 ```
+
+An empty `proton` means "whatever Steam's own default is". `dotnet_done` records that the
+.NET install already ran, so it is not repeated on every launch. Entries written by older
+versions carry a single `program`/`args` pair instead of the list and are still read.
 
 The last launch is logged to `~/.config/coproton/last.log`, including anything the program
 printed as it started.
@@ -233,18 +241,19 @@ So the work is split:
 2. It then **re-enters itself through that runtime's `_v2-entry-point`**, so the game and the
    program share one container as well as one prefix.
 3. **Inside the container** it starts the game with `proton waitforexitandrun`, waits out the
-   delay, and starts the program with `proton runinprefix`. `run` must not be used here: it
-   re-initialises the prefix and can take down the game's wineserver.
-4. It waits for the game to exit, stops the program, and returns the game's exit code so Steam
+   delay, and starts each configured program with `proton runinprefix`. `run` must not be used
+   here: it re-initialises the prefix and can take down the game's wineserver.
+4. It waits for the game to exit, stops the programs, and returns the game's exit code so Steam
    records playtime correctly.
 
-Steam also invokes a compatibility tool to ask about paths rather than to launch anything.
-Those verbs are passed straight through, and start no program.
+Steam also invokes a compatibility tool to ask about paths rather than to launch anything, and
+runs its own install-script evaluator through it once per Steam game before the game itself.
+Neither is a launch: they are passed straight through, with no window and no programs.
 
 ## Known limitations
 
-* The delay before starting the program is a fixed number of seconds rather than a wait for
-  the game process to appear.
+* The delay before starting the programs is a fixed number of seconds rather than a wait for
+  the game process to appear, and every program shares it.
 * Anti-cheat systems (EAC, BattlEye) dislike foreign processes in the prefix. Not something
   this tool can fix.
 * Old Proton builds that declare no runtime are launched directly on the host, which is what
