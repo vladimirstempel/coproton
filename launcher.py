@@ -51,6 +51,8 @@ WEMOD_SHA256 = "5b94ae5592e698b13cbc06fae4c096fe2438cbd362daac3f842e13190bf836ba
 WEMOD_DIR = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
              / "coproton" / ("wemod-" + WEMOD_VERSION))
 WEMOD_PROFILE = WEMOD_DIR.parent / "wemod-profile"
+# Coproton is one file, so updating it is one download.
+UPDATE_URL = "https://raw.githubusercontent.com/vladimirstempel/coproton/main/launcher.py"
 
 
 # ------------------------------------------------------------------ discovery
@@ -339,6 +341,20 @@ def unquote_path(value):
     return (value or "").strip().strip('"').strip("'").strip()
 
 
+def entry_programs(entry):
+    """The programs to run with the game, as a list of {"path", "args"}.
+
+    Configs written before there could be more than one carry a single program/args
+    pair instead, so they are read as a list of one.
+    """
+    listed = entry.get("programs")
+    if listed is None:
+        single = unquote_path(entry.get("program"))
+        listed = [{"path": single, "args": entry.get("args", "")}] if single else []
+    return [{"path": unquote_path(item.get("path")), "args": item.get("args", "")}
+            for item in listed if unquote_path(item.get("path"))]
+
+
 def wine_bin(proton, name="wine"):
     """Proton ships wine under files/ (current) or dist/ (older builds)."""
     base = Path(proton).parent
@@ -507,6 +523,45 @@ def share_wemod_profile(report=print):
         report("could not share the WeMod profile: %s" % exc)
         return False
     report("WeMod profile shared from %s" % WEMOD_PROFILE)
+    return True
+
+
+def update_self(report=print, stop=None, target=None):
+    """Replace this launcher with the one on main. Returns True when it changed.
+
+    The file is compiled before it is installed: a half-downloaded or mangled update
+    would otherwise leave every game unable to start.
+    """
+    import urllib.request
+    target = Path(target or __file__).resolve()
+    try:
+        with urllib.request.urlopen(UPDATE_URL) as response:
+            fresh = response.read()
+    except OSError as exc:
+        report("could not download the update: %s" % exc)
+        return False
+    if stop is not None and stop.is_set():
+        report("update cancelled")
+        return False
+    try:
+        compile(fresh, str(target), "exec")
+    except (SyntaxError, ValueError) as exc:
+        report("the downloaded file is not a working launcher: %s" % exc)
+        return False
+    if fresh == target.read_bytes():
+        report("already up to date")
+        return False
+    try:
+        # Written beside the original and moved into place, so a failure half way
+        # through leaves the working copy alone.
+        fresh_file = target.with_name(target.name + ".new")
+        fresh_file.write_bytes(fresh)
+        fresh_file.chmod(0o755)
+        fresh_file.replace(target)
+    except OSError as exc:
+        report("could not replace %s: %s" % (target, exc))
+        return False
+    report("updated, close and open Coproton again to use the new version")
     return True
 
 
@@ -700,6 +755,29 @@ def outer(argv):
     return code
 
 
+def start_program(proton, path, args=""):
+    """Start one program in the game's prefix. Returns the process, or None."""
+    env = os.environ
+    if path == wemod_exe():
+        share_wemod_profile(log)
+        # wemod_enhancer drops a proxy version.dll next to WeMod.exe. Wine answers
+        # with its own builtin unless the load order asks for a native one first,
+        # and then Electron rejects the patched app.asar.
+        env = dict(os.environ, WINEDLLOVERRIDES="version=n,b")
+    log("starting %s" % path)
+    try:
+        # Output is captured: a trainer that dies on startup used to fail silently.
+        with LOG.open("a") as out:
+            # Electron programs need flags like --disable-gpu, so args are split as a
+            # shell would split them.
+            return subprocess.Popen([proton, "runinprefix", path, *shlex.split(args or "")],
+                                    cwd=str(Path(path).parent), env=env,
+                                    stdout=out, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        log("could not start %s: %s" % (Path(path).name, exc))
+        return None
+
+
 def inner(argv):
     """Container side: start the game, then the program, in one prefix."""
     verb, cmd = argv[0], argv[1:]
@@ -717,44 +795,32 @@ def inner(argv):
     log("appid=%s proton=%s" % (appid or "?", Path(proton).parent.name))
     game = subprocess.Popen([proton, verb, *cmd])
 
-    program, extra = unquote_path(entry.get("program")), None
-    # Electron programs need --disable-gpu under wine, so the flags have to be settable.
-    args = shlex.split(entry.get("args") or "")
-    env = os.environ
-    if program and Path(program).exists():
-        if program == wemod_exe():
-            share_wemod_profile(log)
-            # wemod_enhancer drops a proxy version.dll next to WeMod.exe. Wine answers
-            # with its own builtin unless the load order asks for a native one first,
-            # and then Electron rejects the patched app.asar.
-            env = dict(os.environ, WINEDLLOVERRIDES="version=n,b")
+    programs, extras = [], []
+    for item in entry_programs(entry):
+        if Path(item["path"]).exists():
+            programs.append(item)
+        else:
+            log("program not found: %s" % item["path"])
+    if programs:
         time.sleep(entry.get("delay", DEFAULT_DELAY))
         if game.poll() is None:
-            log("starting %s" % program)
-            try:
-                # Output is captured: a trainer that dies on startup used to fail silently.
-                with LOG.open("a") as out:
-                    extra = subprocess.Popen([proton, "runinprefix", program, *args],
-                                             cwd=str(Path(program).parent), env=env,
-                                             stdout=out, stderr=subprocess.STDOUT)
-            except OSError as exc:
-                log("could not start the program: %s" % exc)
-            if extra is not None:
-                # A program that dies at once used to leave nothing but "starting" in the
-                # log. The usual cause is a prefix the game is still building.
-                time.sleep(2)
-                if extra.poll() is not None:
-                    log("the program exited immediately with %d, the prefix may still be "
-                        "under construction: raise the delay and try again" % extra.returncode)
+            extras = [p for p in (start_program(proton, item["path"], item["args"])
+                                  for item in programs) if p]
+            # A program that dies at once used to leave nothing but "starting" in the
+            # log. The usual cause is a prefix the game is still building.
+            time.sleep(2)
+            for dead in (p for p in extras if p.poll() is not None):
+                log("a program exited immediately with %d, the prefix may still be "
+                    "under construction: raise the delay and try again" % dead.returncode)
         else:
-            log("game exited before the program could start")
-    elif program:
-        log("program not found: %s" % program)
+            log("game exited before the programs could start")
 
     code = game.wait()
-    if extra and extra.poll() is None:
-        # ponytail: only the wrapper is killed, Proton reaps the wine processes on shutdown.
-        extra.terminate()
+    for extra in extras:
+        if extra.poll() is None:
+            # ponytail: only the wrapper is killed, Proton reaps the wine processes on
+            # shutdown.
+            extra.terminate()
     log("game exited with %d" % code)
     return code
 
@@ -937,24 +1003,64 @@ def gui(appid=None, launch=False):
                               values=[follow] + list(all_protons))
     add("Proton", proton_box)
 
-    program_var = tk.StringVar()
-    program_entry = ttk.Entry(frame, textvariable=program_var)
+    # One row per program: as many as the game needs, all started in this order.
+    programs_box = ttk.Frame(frame)
+    programs_box.columnconfigure(0, weight=1)
+    rows = []
 
-    def browse():
+    def redraw_rows():
+        for i, item in enumerate(rows):
+            item["entry"].grid(row=i, column=0, sticky="ew", pady=(0, 6))
+            item["args_entry"].grid(row=i, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+            item["browse"].grid(row=i, column=2, padx=(8, 0), pady=(0, 6))
+            item["remove"].grid(row=i, column=3, padx=(6, 0), pady=(0, 6))
+        toolbar.grid(row=len(rows), column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+    def add_row(path="", args=""):
+        item = {"path_var": tk.StringVar(value=path), "args_var": tk.StringVar(value=args)}
+        item["entry"] = ttk.Entry(programs_box, textvariable=item["path_var"])
+        item["args_entry"] = ttk.Entry(programs_box, textvariable=item["args_var"], width=14)
+        item["browse"] = ttk.Button(programs_box, text="Browse...",
+                                    command=lambda: browse(item))
+        item["remove"] = ttk.Button(programs_box, text="\u00d7", width=2,
+                                    command=lambda: drop_row(item))
+        item["path_var"].trace_add("write", lambda *_: refresh_hint())
+        tooltip(item["args_entry"], "Arguments for this program, split the way a shell "
+                                    "would. Electron programs usually need --disable-gpu.")
+        tooltip(item["remove"], "Drop this program from the list.")
+        rows.append(item)
+        redraw_rows()
+        return item
+
+    def drop_row(item):
+        for key in ("entry", "args_entry", "browse", "remove"):
+            item[key].destroy()
+        rows.remove(item)
+        if not rows:                     # Always leave one row to type into.
+            add_row()
+        redraw_rows()
+        refresh_hint()
+
+    def free_row():
+        """A row with nothing in it, new if every existing one is taken."""
+        return next((item for item in rows if not item["path_var"].get().strip()), None) \
+            or add_row()
+
+    def browse(item):
         start = all_games.get(current_game(), {}).get("dir") or str(Path.home())
         chosen = filedialog.askopenfilename(
-            parent=root, title="Select the program to run with the game",
+            parent=root, title="Select a program to run with the game",
             initialdir=start if Path(start).is_dir() else str(Path.home()),
             filetypes=[("Windows executables", "*.exe"), ("All files", "*")])
         if chosen:
-            program_var.set(chosen)
+            item["path_var"].set(chosen)
             refresh_hint()
 
     def use_wemod():
-        """Fetch WeMod on first use, then point the Program field at it."""
+        """Fetch WeMod on first use, then put it in a row of its own."""
         def picked(exe):
             if exe:
-                program_var.set(exe)
+                free_row()["path_var"].set(exe)
                 dotnet_var.set(True)   # The net45 build needs the framework, not wine-mono.
                 refresh_hint()
         exe = wemod_exe()
@@ -965,24 +1071,21 @@ def gui(appid=None, launch=False):
                  lambda report, stop: install_wemod(report=report, stop=stop),
                  picked, cancellable=True)
 
-    program_buttons = ttk.Frame(frame)
-    browse_button = ttk.Button(program_buttons, text="Browse...", command=browse)
-    browse_button.grid(row=0, column=0)
-    wemod_button = ttk.Button(program_buttons, text="WeMod", command=use_wemod)
-    wemod_button.grid(row=0, column=1, padx=(8, 0))
-    add("Program", program_entry, program_buttons)
-    tooltip(browse_button, "Pick the program to start together with the game: a trainer, "
-                           "an overlay, anything that has to share the game's prefix.")
-    tooltip(wemod_button, "Download WeMod and use it as that program. It needs the real "
-                          ".NET Framework, so the box below is ticked for it.")
+    toolbar = ttk.Frame(programs_box)
+    plus_button = ttk.Button(toolbar, text="+", width=2, command=lambda: add_row())
+    plus_button.grid(row=0, column=0)
+    wemod_button = ttk.Button(toolbar, text="WeMod", command=use_wemod)
+    wemod_button.grid(row=0, column=1, padx=(6, 0))
+    add("Programs", programs_box)
+    tooltip(plus_button, "Add another program. They all start together with the game, in "
+                         "the order listed, and share its prefix.")
+    tooltip(wemod_button, "Download WeMod and add it to the list. It needs the real .NET "
+                          "Framework, so the box below is ticked for it.")
 
     dotnet_var = tk.BooleanVar()
     ttk.Checkbutton(frame, text="Install .NET 4.8 into the prefix (rarely needed)",
                     variable=dotnet_var).grid(row=row, column=1, sticky="w", pady=(0, 8))
     row += 1
-
-    args_var = tk.StringVar()
-    add("Arguments", ttk.Entry(frame, textvariable=args_var))
 
     delay_var = tk.StringVar(value=str(DEFAULT_DELAY))
     add("Delay, seconds", ttk.Spinbox(frame, from_=0, to=600, textvariable=delay_var, width=8))
@@ -1008,24 +1111,30 @@ def gui(appid=None, launch=False):
                 return gid
         return ""
 
+    def listed_programs():
+        return [{"path": unquote_path(item["path_var"].get()),
+                 "args": item["args_var"].get().strip()}
+                for item in rows if unquote_path(item["path_var"].get())]
+
     def refresh_hint():
         notes = []
-        program = unquote_path(program_var.get())
-        if program and not Path(program).exists():
-            notes.append("The program path does not exist.")
+        paths = [item["path"] for item in listed_programs()]
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            notes.append("Not found: %s" % ", ".join(Path(p).name for p in missing))
         # Warn about ticking the box, not about leaving it alone: almost every .NET
         # program runs on the wine-mono that Proton already ships, and installing .NET
         # removes it.
         if dotnet_var.get():
             if not shutil.which("winetricks"):
                 notes.append("winetricks is not installed, .NET cannot be installed.")
-            elif program and program == wemod_exe():
+            elif wemod_exe() in paths:
                 notes.append("WeMod is a net45 build and does need the real framework, "
                              "so leave this ticked.")
             else:
                 notes.append("Rarely needed: .NET programs, WPF included, normally run on "
                              "the wine-mono Proton ships, and installing .NET removes it. "
-                             "Tick this only if the program fails without it.")
+                             "Tick this only if a program fails without it.")
         hint.config(text="  ".join(notes))
 
     def load_game(*_):
@@ -1033,14 +1142,19 @@ def gui(appid=None, launch=False):
         chosen = c.get("proton")
         proton_var.set(next((n for n, p in all_protons.items() if p == chosen), follow)
                        if chosen else follow)
-        program_var.set(unquote_path(c.get("program")))
+        for item in list(rows):
+            for key in ("entry", "args_entry", "browse", "remove"):
+                item[key].destroy()
+            rows.remove(item)
+        for program in entry_programs(c):
+            add_row(program["path"], program["args"])
+        if not rows:
+            add_row()
         dotnet_var.set(bool(c.get("dotnet")))
-        args_var.set(c.get("args", ""))
         delay_var.set(str(c.get("delay", DEFAULT_DELAY)))
         refresh_hint()
 
     game_box.bind("<<ComboboxSelected>>", load_game)
-    program_var.trace_add("write", lambda *_: refresh_hint())
     dotnet_var.trace_add("write", lambda *_: refresh_hint())
 
     busy = {"stop": None}
@@ -1051,6 +1165,7 @@ def gui(appid=None, launch=False):
         busy["stop"] = stop
         save_button.state(["disabled"] if running else ["!disabled"])
         patch_button.state(["disabled"] if running else ["!disabled"])
+        update_button.state(["disabled"] if running else ["!disabled"])
         run_button.state(["disabled"] if running or not launch else ["!disabled"])
         # Cancel doubles as the stop button, but only for jobs that can be stopped.
         cancel_button.state(["disabled"] if running and not stop.settable else ["!disabled"])
@@ -1110,10 +1225,11 @@ def gui(appid=None, launch=False):
         entry = cfg.setdefault(gid, {})
         was = entry.get("dotnet")
         entry.update(proton=chosen_proton(),
-                     program=unquote_path(program_var.get()),
+                     programs=listed_programs(),
                      dotnet=dotnet_var.get(),
-                     args=args_var.get().strip(),
                      delay=int(delay_var.get() or 0))
+        for old_key in ("program", "args"):   # Replaced by the list; keep one truth.
+            entry.pop(old_key, None)
         if was != entry["dotnet"]:
             entry.pop("dotnet_done", None)
         save(cfg)
@@ -1176,10 +1292,20 @@ def gui(appid=None, launch=False):
         elif stop.settable:
             stop.set()
 
-    patch_button = ttk.Button(frame, text="Run in prefix...", command=run_patcher)
-    patch_button.grid(row=row, column=0, sticky="w")
-    buttons = ttk.Frame(frame)
-    buttons.grid(row=row, column=1, columnspan=2, sticky="e")
+    # One bar across the whole width, so the buttons cannot widen the label column.
+    bottom = ttk.Frame(frame)
+    bottom.grid(row=row, column=0, columnspan=3, sticky="ew")
+    bottom.columnconfigure(1, weight=1)
+    bottom_left = ttk.Frame(bottom)
+    bottom_left.grid(row=0, column=0, sticky="w")
+    patch_button = ttk.Button(bottom_left, text="Run in prefix...", command=run_patcher)
+    patch_button.grid(row=0, column=0)
+    update_button = ttk.Button(bottom_left, text="Update", command=lambda: run_busy(
+        "Looking for a newer Coproton...",
+        lambda report, stop: update_self(report=report, stop=stop), lambda _: None))
+    update_button.grid(row=0, column=1, padx=(8, 0))
+    buttons = ttk.Frame(bottom)
+    buttons.grid(row=0, column=2, sticky="e")
     cancel_button = ttk.Button(buttons, text="Cancel", command=cancel_clicked)
     cancel_button.grid(row=0, column=0, padx=4)
     save_button = ttk.Button(buttons, text="Save", command=lambda: finish("save"))
@@ -1190,6 +1316,8 @@ def gui(appid=None, launch=False):
     if not launch:
         run_button.state(["disabled"])            # Nothing to run outside a Steam launch.
 
+    tooltip(update_button, "Fetch the newest Coproton from GitHub and replace this one. "
+                           "Settings and games are untouched; reopen the window afterwards.")
     tooltip(patch_button, "Pick a program and run it in this game's wine prefix right now, "
                           "without starting the game: a patcher, a mod installer, a config "
                           "tool. Its output goes to the log.")
@@ -1467,6 +1595,51 @@ def check_run_in_prefix():
             prefix_path, LOG = kept_prefix, kept_log
 
 
+def check_entry_programs():
+    """The list of programs, including configs written before there was a list."""
+    old = {"program": '"/games/My Trainer.exe"', "args": "--flag"}
+    assert entry_programs(old) == [{"path": "/games/My Trainer.exe", "args": "--flag"}]
+    assert entry_programs({}) == []
+    assert entry_programs({"program": ""}) == []
+    listed = {"programs": [{"path": "/a.exe", "args": ""}, {"path": " ", "args": "x"},
+                           {"path": "'/b.exe'", "args": "--gpu"}]}
+    assert entry_programs(listed) == [{"path": "/a.exe", "args": ""},
+                                      {"path": "/b.exe", "args": "--gpu"}], \
+        "blank rows are dropped and quotes cleaned"
+    # The list wins: it is what the window writes now.
+    assert entry_programs({"program": "/old.exe", "programs": []}) == []
+
+
+def check_update_self():
+    """An update is only installed when it parses and actually differs."""
+    global UPDATE_URL
+    import tempfile
+    kept = UPDATE_URL
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        target, source = tmp / "launcher.py", tmp / "served.py"
+        target.write_text("print('old')\n")
+        UPDATE_URL = source.as_uri()
+        said = []
+        quiet = said.append
+        try:
+            source.write_text("print('old')\n")
+            assert not update_self(report=quiet, target=target), "no change, no update"
+            assert "already up to date" in said[-1], said
+
+            source.write_text("def broken(:\n")
+            assert not update_self(report=quiet, target=target)
+            assert target.read_text() == "print('old')\n", "a broken update must be refused"
+
+            source.write_text("print('new')\n")
+            assert update_self(report=quiet, target=target)
+            assert target.read_text() == "print('new')\n"
+            assert os.access(target, os.X_OK), "the launcher has to stay executable"
+            assert not list(tmp.glob("*.new")), "the temporary file must not be left behind"
+        finally:
+            UPDATE_URL = kept
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -1501,11 +1674,12 @@ def check_launch():
         stub.write_text('#!/bin/sh\necho "$@" >> "%s"\nsleep 0.5\nexit 7\n' % calls)
         stub.chmod(0o755)
         (tmp / "trainer.exe").touch()
+        (tmp / "overlay.exe").touch()
         CONFIG, LOG = tmp / "config.json", tmp / "log"
-        # A quoted path, exactly as the old GUI used to store it.
-        save({"3755078775": {"proton": str(stub),
-                             "program": '"%s"' % (tmp / "trainer.exe"),
-                             "args": "--disable-gpu --flag=a b", "delay": 0}})
+        save({"3755078775": {"proton": str(stub), "delay": 0, "programs": [
+            # A quoted path, exactly as a file manager hands it over.
+            {"path": '"%s"' % (tmp / "trainer.exe"), "args": "--disable-gpu --flag=a b"},
+            {"path": str(tmp / "overlay.exe"), "args": ""}]}})
         os.environ.update(SteamAppId="0", STEAM_COMPAT_DATA_PATH=str(tmp / "3755078775"))
         os.environ.pop("COPROTON_PROTON", None)
         try:
@@ -1516,21 +1690,22 @@ def check_launch():
             CONFIG, LOG = saved_config, saved_log
             os.environ.clear()
             os.environ.update(saved_env)
-        deadline, lines = time.time() + 3, []
+        deadline, lines = time.time() + 4, []
         while time.time() < deadline:
             lines = sorted(calls.read_text().splitlines()) if calls.exists() else []
-            if len(lines) == 3:
+            if len(lines) == 4:
                 break
             time.sleep(0.05)
     assert code == 7, code
-    # Sorted, not in call order: with delay 0 both stubs append concurrently.
-    assert len(lines) == 3, lines
+    # Sorted, not in call order: with delay 0 the stubs append concurrently.
+    assert len(lines) == 4, lines
     assert lines[0] == "getcompatpath /games/game.exe", lines
-    assert lines[1].startswith("runinprefix ") and "trainer.exe" in lines[1], lines
-    assert '"' not in lines[1], "the quoted path must be cleaned before use: %s" % lines[1]
+    assert lines[1].startswith("runinprefix ") and "overlay.exe" in lines[1], lines
+    assert lines[2].startswith("runinprefix ") and "trainer.exe" in lines[2], lines
+    assert '"' not in lines[2], "the quoted path must be cleaned before use: %s" % lines[2]
     # Electron programs need flags like --disable-gpu, split the way a shell would.
-    assert lines[1].endswith("--disable-gpu --flag=a b"), lines[1]
-    assert lines[2] == "waitforexitandrun /games/game.exe -windowed", lines
+    assert lines[2].endswith("--disable-gpu --flag=a b"), lines[2]
+    assert lines[3] == "waitforexitandrun /games/game.exe -windowed", lines
 
 
 def selftest():
@@ -1543,6 +1718,8 @@ def selftest():
     check_theme()
     check_is_launch()
     check_run_in_prefix()
+    check_entry_programs()
+    check_update_self()
     check_winver()
     check_shortcuts()
     check_launch()
