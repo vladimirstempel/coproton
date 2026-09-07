@@ -775,8 +775,8 @@ ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 def split_env(args):
     """Split "NAME=value ... arguments" the way a shell does. Returns (env, arguments).
 
-    It is the only way to give one program its own environment: Blish HUD, for one, needs
-    wine's audio drivers switched off in its process and nowhere else.
+    It is the only way to give one program its own environment, for the cases where a wine
+    setting has to apply to it and not to the game.
     """
     tokens = shlex.split(args or "")
     env = {}
