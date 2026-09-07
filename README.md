@@ -1,6 +1,6 @@
 # Coproton
 
-<img width="828" height="505" alt="image" src="https://github.com/user-attachments/assets/3573269b-67c5-46f8-a396-d7549226941a" />
+<img width="828" height="492" alt="image" src="https://github.com/user-attachments/assets/04f41825-ff89-4ba9-a7c4-479b863bb640" />
 
 Runs a Steam game together with an arbitrary Windows program (a trainer, an overlay, anything)
 **inside the same wine prefix**, and therefore under the same `wineserver`. That shared
