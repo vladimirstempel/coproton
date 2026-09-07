@@ -166,6 +166,17 @@ WINEDLLOVERRIDES=winepulse.drv,winealsa.drv,wineoss.drv,winecoreaudio.drv=
 
 Blish then has no sound of its own. Everything else, the game included, is unaffected.
 
+That gets Blish running, but its overlay is then a black rectangle over the game: it draws a
+transparent window, and wine has no transparency to give it. Blish's own maintainers point
+Linux users at [external-dx11-overlay](https://github.com/SorryQuick/external-dx11-overlay)
+instead, which renders Blish inside the game the way arcdps does, so no window and no
+transparency are needed — and it bundles its own Blish build, which makes both of the
+problems above Coproton's business no longer. Unzip it into the game folder, add
+`addons/LOADER_public/Gw2-Simple-Addon-Loader.exe` as a non-Steam game, and give that
+shortcut a specific Proton rather than the global default. On the Steam version of the game,
+its launch options need `USE_STEAM_LOGIN=1 %command%`, or the launcher asks for ArenaNet
+credentials a Steam account does not have.
+
 ## When the program does not start
 
 Read `~/.config/coproton/last.log` first. Everything the program prints on startup is captured
