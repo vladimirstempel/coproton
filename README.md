@@ -57,10 +57,12 @@ Every button carries a tooltip saying what it does, and long jobs (the .NET inst
 WeMod download) run in the background: the buttons lock, a bar spins, and **Cancel** turns
 into **Stop** for anything that can be abandoned.
 
-**Update** fetches the newest Coproton from GitHub and replaces the installed file. The
-download is compiled before it is put in place, so a broken or half-finished update cannot
-leave the launcher unable to start a game. Settings and games are untouched, and the new
-version applies when the window is opened again.
+**Update** fetches the newest Coproton from GitHub: `launcher.py` and the two `.vdf` files
+Steam reads to offer the tool at all. The launcher is compiled and a manifest has to look
+like one before either is put in place, so a broken or half-finished update cannot leave the
+tool unable to start a game or missing from Steam's list. Files that already match are left
+alone, the registration symlink and the settings are never touched, and the new version
+applies when the window is opened again.
 
 **Run in prefix...** picks a program and runs it in the selected game's wine prefix straight
 away, with no game and no launch: a patcher, a mod installer, a redistributable, a

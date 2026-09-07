@@ -51,8 +51,10 @@ WEMOD_SHA256 = "5b94ae5592e698b13cbc06fae4c096fe2438cbd362daac3f842e13190bf836ba
 WEMOD_DIR = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
              / "coproton" / ("wemod-" + WEMOD_VERSION))
 WEMOD_PROFILE = WEMOD_DIR.parent / "wemod-profile"
-# Coproton is one file, so updating it is one download.
-UPDATE_URL = "https://raw.githubusercontent.com/vladimirstempel/coproton/main/launcher.py"
+# What the Update button fetches: the launcher, plus the two files Steam reads to offer
+# Coproton in the first place.
+UPDATE_BASE = "https://raw.githubusercontent.com/vladimirstempel/coproton/main/"
+UPDATE_FILES = ("launcher.py", "toolmanifest.vdf", "compatibilitytool.vdf")
 
 
 # ------------------------------------------------------------------ discovery
@@ -527,41 +529,53 @@ def share_wemod_profile(report=print):
 
 
 def update_self(report=print, stop=None, target=None):
-    """Replace this launcher with the one on main. Returns True when it changed.
+    """Replace the installed files with the ones on main. Returns True when any changed.
 
-    The file is compiled before it is installed: a half-downloaded or mangled update
-    would otherwise leave every game unable to start.
+    launcher.py is compiled before it is installed, and a manifest has to look like one:
+    a truncated or mangled download would otherwise leave every game unable to start, or
+    take Coproton out of Steam's list altogether. Files that already match are left alone,
+    so the registration symlink and the settings never need touching.
     """
     import urllib.request
-    target = Path(target or __file__).resolve()
-    try:
-        with urllib.request.urlopen(UPDATE_URL) as response:
-            fresh = response.read()
-    except OSError as exc:
-        report("could not download the update: %s" % exc)
-        return False
-    if stop is not None and stop.is_set():
-        report("update cancelled")
-        return False
-    try:
-        compile(fresh, str(target), "exec")
-    except (SyntaxError, ValueError) as exc:
-        report("the downloaded file is not a working launcher: %s" % exc)
-        return False
-    if fresh == target.read_bytes():
+    here = Path(target or __file__).resolve().parent
+    changed = []
+    for name in UPDATE_FILES:
+        if stop is not None and stop.is_set():
+            report("update cancelled")
+            break
+        try:
+            with urllib.request.urlopen(UPDATE_BASE + name) as response:
+                fresh = response.read()
+        except OSError as exc:
+            report("could not download %s: %s" % (name, exc))
+            break
+        if name.endswith(".py"):
+            try:
+                compile(fresh, name, "exec")
+            except (SyntaxError, ValueError) as exc:
+                report("%s is not a working launcher: %s" % (name, exc))
+                break
+        elif b'"' not in fresh:
+            report("%s does not look like a Steam manifest" % name)
+            break
+        path = here / name
+        if path.exists() and path.read_bytes() == fresh:
+            continue
+        try:
+            # Written beside the original and moved into place, so a failure half way
+            # through leaves the working copy alone.
+            fresh_file = path.with_name(path.name + ".new")
+            fresh_file.write_bytes(fresh)
+            fresh_file.chmod(0o755 if name.endswith(".py") else 0o644)
+            fresh_file.replace(path)
+        except OSError as exc:
+            report("could not replace %s: %s" % (path, exc))
+            break
+        changed.append(name)
+    if not changed:
         report("already up to date")
         return False
-    try:
-        # Written beside the original and moved into place, so a failure half way
-        # through leaves the working copy alone.
-        fresh_file = target.with_name(target.name + ".new")
-        fresh_file.write_bytes(fresh)
-        fresh_file.chmod(0o755)
-        fresh_file.replace(target)
-    except OSError as exc:
-        report("could not replace %s: %s" % (target, exc))
-        return False
-    report("updated, close and open Coproton again to use the new version")
+    report("updated %s, close and open Coproton again to use it" % ", ".join(changed))
     return True
 
 
@@ -1611,33 +1625,50 @@ def check_entry_programs():
 
 
 def check_update_self():
-    """An update is only installed when it parses and actually differs."""
-    global UPDATE_URL
+    """Only a download that parses, and actually differs, is installed."""
+    global UPDATE_BASE
     import tempfile
-    kept = UPDATE_URL
+    kept = UPDATE_BASE
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        target, source = tmp / "launcher.py", tmp / "served.py"
-        target.write_text("print('old')\n")
-        UPDATE_URL = source.as_uri()
+        installed, served = tmp / "installed", tmp / "served"
+        installed.mkdir()
+        served.mkdir()
+        UPDATE_BASE = served.as_uri() + "/"
+        target = installed / "launcher.py"
+        manifest, tool = "toolmanifest.vdf", "compatibilitytool.vdf"
         said = []
-        quiet = said.append
+
+        def serve(launcher, first='"manifest" { "version" "2" }', second='"tool" { }'):
+            (served / "launcher.py").write_text(launcher)
+            (served / manifest).write_text(first)
+            (served / tool).write_text(second)
+
         try:
-            source.write_text("print('old')\n")
-            assert not update_self(report=quiet, target=target), "no change, no update"
+            serve("print('old')\n")
+            for name in UPDATE_FILES:
+                (installed / name).write_bytes((served / name).read_bytes())
+            assert not update_self(report=said.append, target=target), "no change, no update"
             assert "already up to date" in said[-1], said
 
-            source.write_text("def broken(:\n")
-            assert not update_self(report=quiet, target=target)
-            assert target.read_text() == "print('old')\n", "a broken update must be refused"
+            serve("def broken(:\n")
+            assert not update_self(report=said.append, target=target)
+            assert target.read_text() == "print('old')\n", "a broken launcher must be refused"
 
-            source.write_text("print('new')\n")
-            assert update_self(report=quiet, target=target)
+            serve("print('old')\n", first="not a manifest at all")
+            assert not update_self(report=said.append, target=target)
+            assert (installed / manifest).read_text() == '"manifest" { "version" "2" }', \
+                "a manifest that is not one must be refused"
+
+            serve("print('new')\n", first='"manifest" { "version" "3" }')
+            assert update_self(report=said.append, target=target)
             assert target.read_text() == "print('new')\n"
+            assert (installed / manifest).read_text() == '"manifest" { "version" "3" }'
+            assert (installed / tool).read_text() == '"tool" { }', "unchanged files are left"
             assert os.access(target, os.X_OK), "the launcher has to stay executable"
-            assert not list(tmp.glob("*.new")), "the temporary file must not be left behind"
+            assert not list(installed.glob("*.new")), "no temporary file may be left behind"
         finally:
-            UPDATE_URL = kept
+            UPDATE_BASE = kept
 
 
 def check_shortcuts():
