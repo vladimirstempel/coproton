@@ -769,22 +769,38 @@ def outer(argv):
     return code
 
 
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def split_env(args):
+    """Split "NAME=value ... arguments" the way a shell does. Returns (env, arguments).
+
+    It is the only way to give one program its own environment: Blish HUD, for one, needs
+    wine's audio drivers switched off in its process and nowhere else.
+    """
+    tokens = shlex.split(args or "")
+    env = {}
+    while tokens and ENV_ASSIGNMENT.match(tokens[0]):
+        name, value = tokens.pop(0).split("=", 1)
+        env[name] = value
+    return env, tokens
+
+
 def start_program(proton, path, args=""):
     """Start one program in the game's prefix. Returns the process, or None."""
-    env = os.environ
+    extra_env, arguments = split_env(args)
+    env = dict(os.environ, **extra_env) if extra_env else os.environ
     if path == wemod_exe():
         share_wemod_profile(log)
         # wemod_enhancer drops a proxy version.dll next to WeMod.exe. Wine answers
         # with its own builtin unless the load order asks for a native one first,
         # and then Electron rejects the patched app.asar.
-        env = dict(os.environ, WINEDLLOVERRIDES="version=n,b")
+        env = dict(env, WINEDLLOVERRIDES="version=n,b", **extra_env)
     log("starting %s" % path)
     try:
         # Output is captured: a trainer that dies on startup used to fail silently.
         with LOG.open("a") as out:
-            # Electron programs need flags like --disable-gpu, so args are split as a
-            # shell would split them.
-            return subprocess.Popen([proton, "runinprefix", path, *shlex.split(args or "")],
+            return subprocess.Popen([proton, "runinprefix", path, *arguments],
                                     cwd=str(Path(path).parent), env=env,
                                     stdout=out, stderr=subprocess.STDOUT)
     except OSError as exc:
@@ -1040,7 +1056,9 @@ def gui(appid=None, launch=False):
                                     command=lambda: drop_row(item))
         item["path_var"].trace_add("write", lambda *_: refresh_hint())
         tooltip(item["args_entry"], "Arguments for this program, split the way a shell "
-                                    "would. Electron programs usually need --disable-gpu.")
+                                    "would. Electron programs usually need --disable-gpu. "
+                                    "Leading NAME=value pairs, again as in a shell, set "
+                                    "environment for this program alone.")
         tooltip(item["remove"], "Drop this program from the list.")
         rows.append(item)
         redraw_rows()
@@ -1671,6 +1689,20 @@ def check_update_self():
             UPDATE_BASE = kept
 
 
+def check_split_env():
+    """Leading NAME=value tokens belong to the environment, the rest to the program."""
+    env, args = split_env("WINEDLLOVERRIDES=winepulse.drv= --disable-gpu --flag=a")
+    assert env == {"WINEDLLOVERRIDES": "winepulse.drv="}, env
+    assert args == ["--disable-gpu", "--flag=a"], "a flag with = is not an assignment"
+    assert split_env("") == ({}, [])
+    assert split_env("--windowed") == ({}, ["--windowed"])
+    # Two of them, and quoting works as in a shell.
+    env, args = split_env('A=1 B="two words" prog.exe')
+    assert env == {"A": "1", "B": "two words"} and args == ["prog.exe"], (env, args)
+    # Only leading ones: anything after the first real argument is an argument.
+    assert split_env("--flag NAME=value") == ({}, ["--flag", "NAME=value"])
+
+
 def check_shortcuts():
     """Byte-for-byte shape of a real shortcuts.vdf entry, including the negative appid."""
     blob = (b"\x00shortcuts\x00"
@@ -1750,6 +1782,7 @@ def selftest():
     check_is_launch()
     check_run_in_prefix()
     check_entry_programs()
+    check_split_env()
     check_update_self()
     check_winver()
     check_shortcuts()

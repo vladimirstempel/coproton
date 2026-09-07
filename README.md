@@ -46,7 +46,10 @@ Steam Deck, Bazzite and other immutable distros.
      installed build is used instead.
    * **Programs** — one row per executable to run alongside the game, each with its own
      arguments. **+** adds a row, **×** drops one. They all start after the delay, in the
-     order listed, and share the game's prefix.
+     order listed, and share the game's prefix. Arguments are split the way a shell splits
+     them, and leading `NAME=value` pairs — again as in a shell — set environment variables
+     for that one program, which is how a program that needs a wine setting of its own gets
+     it without the game being affected.
    * **Install .NET 4.8** — rarely needed, see below. Proton's wine-mono already runs most
      .NET programs, and installing .NET removes it.
    * **Delay** — how long to wait after the game starts before launching the programs.
@@ -144,6 +147,24 @@ Coproton does not apply it, but it does launch WeMod so that a patched copy work
 installs, are **not** needed. They were tried and reverted: they change nothing for WeMod, and
 the leftover `libvkd3d-*.dll` they leave behind coincided with the game dying on a
 `vkCreateComputePipelines` assertion inside winevulkan.
+
+## Blish HUD
+
+Blish HUD crashes a few seconds after it finds Guild Wars 2, with
+`System.NotImplementedException` from `NAudio.CoreAudioApi.AudioSessionManager.Finalize`.
+It is not a Coproton problem and no Proton build avoids it: when the game starts, Blish walks
+every audio endpoint and touches `device.AudioSessionManager`, wine answers `E_NOTIMPL` for
+the session notifications behind it, Blish swallows that exception, and the half-built object
+then throws the same error again from its finaliser, where nothing can catch it.
+
+Giving Blish a prefix with no audio devices at all avoids the walk. Put this in its arguments
+row, which applies to Blish and leaves the game's sound alone:
+
+```
+WINEDLLOVERRIDES=winepulse.drv,winealsa.drv,wineoss.drv,winecoreaudio.drv=
+```
+
+Blish then has no sound of its own. Everything else, the game included, is unaffected.
 
 ## When the program does not start
 
