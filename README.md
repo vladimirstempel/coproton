@@ -44,18 +44,25 @@ Steam Deck, Bazzite and other immutable distros.
      of `CompatToolMapping` in `config.vdf`, and it only exists once "Enable Steam Play for
      all other titles" has been turned on. When it is unset, the entry says so and the newest
      installed build is used instead.
-   * **Program** — the executable to run alongside it, picked with a file dialog.
+   * **Programs** — one row per executable to run alongside the game, each with its own
+     arguments. **+** adds a row, **×** drops one. They all start after the delay, in the
+     order listed, and share the game's prefix.
    * **Install .NET 4.8** — rarely needed, see below. Proton's wine-mono already runs most
      .NET programs, and installing .NET removes it.
-   * **Arguments** — passed to the program, split the way a shell would. Electron programs
-     usually need `--disable-gpu` under wine.
-   * **Delay** — how long to wait after the game starts before launching the program.
+   * **Delay** — how long to wait after the game starts before launching the programs.
 3. **Cancel** aborts the launch, **Save** stores the settings without starting the game,
    **Save and Run** starts the game.
 
 Every button carries a tooltip saying what it does, and long jobs (the .NET install, the
 WeMod download) run in the background: the buttons lock, a bar spins, and **Cancel** turns
 into **Stop** for anything that can be abandoned.
+
+**Update** fetches the newest Coproton from GitHub: `launcher.py` and the two `.vdf` files
+Steam reads to offer the tool at all. The launcher is compiled and a manifest has to look
+like one before either is put in place, so a broken or half-finished update cannot leave the
+tool unable to start a game or missing from Steam's list. Files that already match are left
+alone, the registration symlink and the settings are never touched, and the new version
+applies when the window is opened again.
 
 **Run in prefix...** picks a program and runs it in the selected game's wine prefix straight
 away, with no game and no launch: a patcher, a mod installer, a redistributable, a
