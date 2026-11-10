@@ -1,5 +1,7 @@
 # Coproton
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/stempelv)
+
 <img width="828" height="492" alt="image" src="https://github.com/user-attachments/assets/04f41825-ff89-4ba9-a7c4-479b863bb640" />
 
 Runs a Steam game together with an arbitrary Windows program (a trainer, an overlay, anything)
@@ -244,10 +246,6 @@ rm -rf ~/.local/lib/coproton ~/.local/bin/coproton ~/.config/coproton \
 the runtime-requirement lookup, .NET detection, and the whole launch sequence against a stub
 `proton` — including that a quoted path is cleaned before use and that path queries start
 nothing. No external dependencies, no test framework.
-
-## Support
-
-Coproton is free. If it saves you time, you can [buy me a coffee](https://buymeacoffee.com/stempelv).
 
 ## License
 
