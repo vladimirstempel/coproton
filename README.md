@@ -245,6 +245,10 @@ the runtime-requirement lookup, .NET detection, and the whole launch sequence ag
 `proton` — including that a quoted path is cleaned before use and that path queries start
 nothing. No external dependencies, no test framework.
 
+## Support
+
+Coproton is free. If it saves you time, you can [buy me a coffee](https://buymeacoffee.com/stempelv).
+
 ## License
 
 MIT
